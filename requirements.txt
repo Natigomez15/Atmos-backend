@@ -1,8 +1,12 @@
 fastapi
-uvicorn
+uvicorn[standard]
+supabase
+pyrebase4
+python-dotenv
+pydantic
+pydantic-settings
+httpx
+websockets
 
-Una librería por línea:
-pyrebase4==4.8.0
-supabase==2.15.3
-httpx==0.28.1
-websockets==15.0.1
+
+

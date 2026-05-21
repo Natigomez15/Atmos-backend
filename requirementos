@@ -1,0 +1,6 @@
+# Instalar librerías necesarias para Atmos
+
+pip install pyrebase4
+pip install supabase
+pip install httpx
+pip install websockets

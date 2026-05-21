@@ -1,0 +1,59 @@
+import pyrebase
+from supabase import create_client
+from datetime import datetime
+import time
+
+firebaseConfig = {
+    "apiKey": "AIzaSyByJn37VtJtQfC4sMb2eJDt1NflFQxuwhI",
+    "authDomain": "prueba-de-prototipo-d1639.firebaseapp.com",
+    "databaseURL": "https://prueba-de-prototipo-d1639-default-rtdb.firebaseio.com/",
+    "storageBucket": "prueba-de-prototipo-d1639.appspot.com"
+}
+
+firebase = pyrebase.initialize_app(firebaseConfig)
+db = firebase.database()
+
+SUPABASE_URL = "https://wuktedqzmwzdwvvgxznb.supabase.co"
+SUPABASE_KEY = "sb_publishable_ltvDAd8prsdu4C-_fqLSzA_H7NwlNSX"
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+registros_enviados = set()
+
+print("Sincronizando Atmos...")
+
+while True:
+    try:
+        datos = db.child("Atmos").get().val()
+
+        if datos:
+            for aire, contenido in datos.items():
+                if "registros" in contenido:
+                    registros = contenido["registros"]
+
+                    for key, valor in registros.items():
+                        registro_id = f"{aire}_{key}"
+
+                        if registro_id in registros_enviados:
+                            continue
+
+                        registro = {
+                            "sensor": valor.get("sensor", aire),
+                            "temperatura_dht11": valor.get("temperatura", 0),
+                            "temperatura_ds18b20": valor.get("temperatura_ds18b20", 0),
+                            "humedad": valor.get("humedad", 0),
+                            "movimiento": valor.get("movimiento", 0),
+                            "fecha": datetime.now().isoformat()
+                        }
+
+                        supabase.table("registros").insert(registro).execute()
+
+                        registros_enviados.add(registro_id)
+
+                        print("Registro enviado:", registro)
+
+        time.sleep(15)
+
+    except Exception as e:
+        print("Error:", e)
+        time.sleep(10)

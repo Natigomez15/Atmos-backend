@@ -6,6 +6,9 @@ class Configuracion(BaseSettings):
     SUPABASE_URL: str
     SUPABASE_KEY: str
 
+    # Cron
+    CRON_SECRET: str
+
     # Firebase
     FIREBASE_API_KEY: str
     FIREBASE_AUTH_DOMAIN: str

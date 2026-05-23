@@ -1,8 +1,9 @@
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Header, Request
 from datetime import datetime, timezone
 from uuid import UUID
-from typing import Annotated
+from typing import Annotated, Optional
 from pydantic import Field
+
 from app.models.schemas import (
     RegistroCrear,
     RegistroRespuesta,
@@ -10,7 +11,11 @@ from app.models.schemas import (
     LecturaSensorRespuesta,
 )
 from app.core.database import obtener_cliente
-from app.services.aggregation import agregar_lecturas
+from app.core.logger import log
+from app.core.websocket_manager import gestor
+from app.services.aggregation import agregar_lecturas, ServicioAgregacion
+from app.config import configuracion
+from app.main import limitador
 
 enrutador = APIRouter(prefix="/lecturas", tags=["lecturas"])
 
@@ -20,32 +25,68 @@ enrutador = APIRouter(prefix="/lecturas", tags=["lecturas"])
 # ---------------------------------------------------------------------------
 
 @enrutador.post("/", response_model=LecturaSensorRespuesta, status_code=201)
-async def crear_lectura(lectura: LecturaSensorCrear):
+@limitador.limit("60/minute")
+async def crear_lectura(solicitud: Request, lectura: LecturaSensorCrear):
     cliente = obtener_cliente()
+    try:
+        nodo_existente = (
+            cliente.table("nodes").select("id").eq("id", str(lectura.nodo_id)).execute()
+        )
+        if not nodo_existente.data:
+            raise HTTPException(status_code=404, detail="Nodo no encontrado")
 
-    nodo_existente = (
-        cliente.table("nodes").select("id").eq("id", str(lectura.nodo_id)).execute()
-    )
-    if not nodo_existente.data:
-        raise HTTPException(status_code=404, detail="Nodo no encontrado")
+        ahora = datetime.now(timezone.utc).isoformat()
+        cliente.table("nodes").update({"ultima_vez_visto": ahora}).eq(
+            "id", str(lectura.nodo_id)
+        ).execute()
 
-    ahora = datetime.now(timezone.utc).isoformat()
-    cliente.table("nodes").update({"ultima_vez_visto": ahora}).eq(
-        "id", str(lectura.nodo_id)
-    ).execute()
+        respuesta = (
+            cliente.table("sensor_readings")
+            .insert(lectura.model_dump(mode="json"))
+            .execute()
+        )
+        if not respuesta.data:
+            raise HTTPException(status_code=400, detail="Error al insertar la lectura")
 
-    respuesta = (
-        cliente.table("sensor_readings")
-        .insert(lectura.model_dump(mode="json"))
-        .execute()
-    )
-    if not respuesta.data:
-        raise HTTPException(status_code=400, detail="Error al insertar la lectura")
-    return respuesta.data[0]
+        fila = respuesta.data[0]
+        log.info({
+            "evento":     "lectura_guardada",
+            "nodo_id":    str(lectura.nodo_id),
+            "sala_id":    str(lectura.sala_id),
+            "potencia_w": lectura.potencia_w,
+        })
+
+        await gestor.transmitir_a_sala(
+            sala_id=str(lectura.sala_id),
+            datos={
+                "tipo":          "nueva_lectura",
+                "sala_id":       str(lectura.sala_id),
+                "registrado_en": fila.get("registrado_en"),
+                "temperatura":   lectura.temperatura,
+                "humedad":       lectura.humedad,
+                "presencia":     lectura.presencia,
+                "potencia_w":    lectura.potencia_w,
+                "ac_encendido":  lectura.ac_encendido,
+                "setpoint_ac":   lectura.setpoint_ac,
+            },
+        )
+        return fila
+
+    except HTTPException:
+        raise
+    except Exception as error:
+        log.error({
+            "evento":  "lectura_fallida",
+            "error":   str(error),
+            "payload": lectura.model_dump(mode="json"),
+        })
+        raise HTTPException(status_code=500, detail="Error interno al guardar la lectura")
 
 
 @enrutador.post("/lote")
+@limitador.limit("10/minute")
 async def crear_lecturas_lote(
+    solicitud: Request,
     lecturas: Annotated[list[LecturaSensorCrear], Field(max_length=50)],
 ):
     if len(lecturas) > 50:
@@ -69,7 +110,9 @@ async def crear_lecturas_lote(
 
 
 @enrutador.get("/", response_model=list[LecturaSensorRespuesta])
+@limitador.limit("30/minute")
 async def listar_lecturas(
+    solicitud: Request,
     sala_id: UUID,
     inicio: datetime,
     fin: datetime,
@@ -105,6 +148,20 @@ async def ultima_lectura_sala(sala_id: UUID):
             status_code=404, detail="No se encontraron lecturas para esta sala"
         )
     return respuesta.data[0]
+
+
+# ---------------------------------------------------------------------------
+# Agregación horaria (disparada por cron-job.org)
+# ---------------------------------------------------------------------------
+
+@enrutador.post("/disparar-agregacion")
+async def disparar_agregacion(
+    x_cron_secret: Annotated[Optional[str], Header()] = None,
+):
+    if not x_cron_secret or x_cron_secret != configuracion.CRON_SECRET:
+        raise HTTPException(status_code=401, detail="No autorizado")
+    resultado = ServicioAgregacion().agregar_todas_las_salas()
+    return resultado
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from datetime import datetime
 from typing import Optional, Literal
 from uuid import UUID
@@ -122,6 +122,44 @@ class ComandoACCrear(BaseModel):
     sala_id: UUID
     nodo_id: Optional[UUID] = None
     tipo_comando: Literal["on", "off", "setpoint", "mode", "fan_speed"]
-    setpoint: Optional[int] = None
+    setpoint: Optional[int] = Field(None, ge=16, le=30)
     modo: Optional[str] = None
     origen: Literal["ml_model", "manual", "schedule", "emergency"]
+
+
+class ComandoACRespuesta(ComandoACCrear):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    enviado_en: datetime
+    ejecutado_en: Optional[datetime] = None
+    fue_ejecutado: bool
+
+
+class ComandoPendienteRespuesta(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    tipo_comando: str
+    setpoint: Optional[int] = None
+    modo: Optional[str] = None
+    enviado_en: datetime
+
+
+# ---------------------------------------------------------------------------
+# Alertas
+# ---------------------------------------------------------------------------
+
+class AlertaRespuesta(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    sala_id: UUID
+    nodo_id: Optional[UUID] = None
+    tipo_alerta: str
+    severidad: str
+    mensaje: str
+    detalle: Optional[dict] = None
+    esta_resuelta: bool
+    creado_en: datetime
+    resuelto_en: Optional[datetime] = None

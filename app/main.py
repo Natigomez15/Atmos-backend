@@ -4,23 +4,21 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from slowapi import Limiter
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi import _rate_limit_exceeded_handler
 
 from app.api import rooms, nodes, readings, ml, ac_commands, alerts, websockets, telegram
 from app.core.database import obtener_cliente
+from app.core.limiter import limitador
 from app.core.logger import log
 from app.core.websocket_manager import gestor
 
-limitador = Limiter(key_func=get_remote_address)
+app = FastAPI(title="ATMOS API")
 
-aplicacion = FastAPI(title="ATMOS API")
+app.state.limiter = limitador
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-aplicacion.state.limiter = limitador
-aplicacion.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-
-aplicacion.add_middleware(
+app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
@@ -28,17 +26,17 @@ aplicacion.add_middleware(
     allow_headers=["*"],
 )
 
-aplicacion.include_router(rooms.enrutador, prefix="/api/v1")
-aplicacion.include_router(nodes.enrutador, prefix="/api/v1")
-aplicacion.include_router(readings.enrutador, prefix="/api/v1")
-aplicacion.include_router(ml.enrutador, prefix="/api/v1")
-aplicacion.include_router(ac_commands.enrutador, prefix="/api/v1")
-aplicacion.include_router(alerts.enrutador, prefix="/api/v1")
-aplicacion.include_router(websockets.enrutador, prefix="/api/v1")
-aplicacion.include_router(telegram.enrutador, prefix="/api/v1")
+app.include_router(rooms.enrutador, prefix="/api/v1")
+app.include_router(nodes.enrutador, prefix="/api/v1")
+app.include_router(readings.enrutador, prefix="/api/v1")
+app.include_router(ml.enrutador, prefix="/api/v1")
+app.include_router(ac_commands.enrutador, prefix="/api/v1")
+app.include_router(alerts.enrutador, prefix="/api/v1")
+app.include_router(websockets.enrutador, prefix="/api/v1")
+app.include_router(telegram.enrutador, prefix="/api/v1")
 
 
-@aplicacion.on_event("startup")
+@app.on_event("startup")
 async def iniciar_heartbeat():
     async def bucle_heartbeat():
         while True:
@@ -50,7 +48,7 @@ async def iniciar_heartbeat():
     asyncio.create_task(bucle_heartbeat())
 
 
-@aplicacion.middleware("http")
+@app.middleware("http")
 async def registrar_peticion(solicitud: Request, siguiente) -> Response:
     inicio = time.monotonic()
     respuesta: Response = await siguiente(solicitud)
@@ -73,7 +71,7 @@ async def registrar_peticion(solicitud: Request, siguiente) -> Response:
     return respuesta
 
 
-@aplicacion.get("/health")
+@app.get("/health")
 async def estado_servicio():
     try:
         obtener_cliente().table("rooms").select("count", count="exact").limit(1).execute()

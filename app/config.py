@@ -3,17 +3,17 @@ from pydantic_settings import BaseSettings
 
 class Configuracion(BaseSettings):
     # Supabase
-    SUPABASE_URL: str
-    SUPABASE_KEY: str
+    SUPABASE_URL: str = ""
+    SUPABASE_KEY: str = ""
 
     # Cron
-    CRON_SECRET: str
+    CRON_SECRET: str = ""
 
     # Firebase
-    FIREBASE_API_KEY: str
-    FIREBASE_AUTH_DOMAIN: str
-    FIREBASE_DATABASE_URL: str
-    FIREBASE_STORAGE_BUCKET: str
+    FIREBASE_API_KEY: str = ""
+    FIREBASE_AUTH_DOMAIN: str = ""
+    FIREBASE_DATABASE_URL: str = ""
+    FIREBASE_STORAGE_BUCKET: str = ""
 
     # Telegram
     TELEGRAM_BOT_TOKEN: str = ""

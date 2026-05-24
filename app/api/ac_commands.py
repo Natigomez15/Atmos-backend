@@ -24,14 +24,14 @@ from app.models.schemas import (
 )
 from app.core.database import obtener_cliente
 from app.core.websocket_manager import gestor
-from app.main import limitador
+from app.core.limiter import limitador
 
 enrutador = APIRouter(prefix="/comandos-ac", tags=["comandos-ac"])
 
 
-@enrutador.post("/", response_model=ComandoACRespuesta, status_code=201)
 @limitador.limit("30/minute")
-async def crear_comando(solicitud: Request, comando: ComandoACCrear):
+@enrutador.post("/", response_model=ComandoACRespuesta, status_code=201)
+async def crear_comando(request: Request, comando: ComandoACCrear):
     if comando.tipo_comando == "setpoint" and comando.setpoint is None:
         raise HTTPException(
             status_code=422,
@@ -49,9 +49,9 @@ async def crear_comando(solicitud: Request, comando: ComandoACCrear):
     return respuesta.data[0]
 
 
-@enrutador.get("/pendientes/{nodo_id}", response_model=list[ComandoPendienteRespuesta])
 @limitador.limit("120/minute")
-async def obtener_comandos_pendientes(solicitud: Request, nodo_id: UUID):
+@enrutador.get("/pendientes/{nodo_id}", response_model=list[ComandoPendienteRespuesta])
+async def obtener_comandos_pendientes(request: Request, nodo_id: UUID):
     # Solo retorna — NO marca como ejecutados. El ESP32 confirma por separado.
     cliente = obtener_cliente()
     hace_30_min = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()

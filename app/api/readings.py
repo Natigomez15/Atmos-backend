@@ -15,7 +15,7 @@ from app.core.logger import log
 from app.core.websocket_manager import gestor
 from app.services.aggregation import agregar_lecturas, ServicioAgregacion
 from app.config import configuracion
-from app.main import limitador
+from app.core.limiter import limitador
 
 enrutador = APIRouter(prefix="/lecturas", tags=["lecturas"])
 
@@ -24,9 +24,9 @@ enrutador = APIRouter(prefix="/lecturas", tags=["lecturas"])
 # Lecturas de sensores ESP32
 # ---------------------------------------------------------------------------
 
-@enrutador.post("/", response_model=LecturaSensorRespuesta, status_code=201)
 @limitador.limit("60/minute")
-async def crear_lectura(solicitud: Request, lectura: LecturaSensorCrear):
+@enrutador.post("/", response_model=LecturaSensorRespuesta, status_code=201)
+async def crear_lectura(request: Request, lectura: LecturaSensorCrear):
     cliente = obtener_cliente()
     try:
         nodo_existente = (
@@ -83,12 +83,9 @@ async def crear_lectura(solicitud: Request, lectura: LecturaSensorCrear):
         raise HTTPException(status_code=500, detail="Error interno al guardar la lectura")
 
 
-@enrutador.post("/lote")
 @limitador.limit("10/minute")
-async def crear_lecturas_lote(
-    solicitud: Request,
-    lecturas: Annotated[list[LecturaSensorCrear], Field(max_length=50)],
-):
+@enrutador.post("/lote")
+async def crear_lecturas_lote(request: Request, lecturas: list[LecturaSensorCrear]):
     if len(lecturas) > 50:
         raise HTTPException(
             status_code=422, detail="El lote no puede superar 50 lecturas"
@@ -109,10 +106,10 @@ async def crear_lecturas_lote(
     return {"insertados": insertados, "errores": errores}
 
 
-@enrutador.get("/", response_model=list[LecturaSensorRespuesta])
 @limitador.limit("30/minute")
+@enrutador.get("/", response_model=list[LecturaSensorRespuesta])
 async def listar_lecturas(
-    solicitud: Request,
+    request: Request,
     sala_id: UUID,
     inicio: datetime,
     fin: datetime,

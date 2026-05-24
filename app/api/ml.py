@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 from app.ml.predictor import ServicioPredictor
 from app.core.database import obtener_cliente
 from app.config import configuracion
-from app.main import limitador
+from app.core.limiter import limitador
 
 enrutador = APIRouter(prefix="/ml", tags=["ml"])
 
@@ -28,10 +28,10 @@ class EntradaPrediccion(BaseModel):
 # Endpoints
 # ---------------------------------------------------------------------------
 
-@enrutador.get("/caracteristicas/{sala_id}")
 @limitador.limit("10/minute")
+@enrutador.get("/caracteristicas/{sala_id}")
 async def obtener_caracteristicas(
-    solicitud: Request,
+    request: Request,
     sala_id: UUID,
     dias_atras: Annotated[int, Query(ge=1, le=90)] = 30,
 ):
@@ -46,9 +46,9 @@ async def obtener_caracteristicas(
     return caracteristicas
 
 
-@enrutador.post("/predicciones", status_code=201)
 @limitador.limit("20/minute")
-async def guardar_prediccion(solicitud: Request, entrada: EntradaPrediccion):
+@enrutador.post("/predicciones", status_code=201)
+async def guardar_prediccion(request: Request, entrada: EntradaPrediccion):
     carga = entrada.model_dump(mode="json")
     sala_id = carga.pop("sala_id")
     try:

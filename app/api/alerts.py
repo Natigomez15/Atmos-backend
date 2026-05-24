@@ -7,15 +7,15 @@ from app.models.schemas import AlertaRespuesta
 from app.core.database import obtener_cliente
 from app.services.alert_service import ServicioAlertas
 from app.config import configuracion
-from app.main import limitador
+from app.core.limiter import limitador
 
 enrutador = APIRouter(prefix="/alertas", tags=["alertas"])
 
 
-@enrutador.get("/", response_model=list[AlertaRespuesta])
 @limitador.limit("30/minute")
+@enrutador.get("/", response_model=list[AlertaRespuesta])
 async def listar_alertas(
-    solicitud: Request,
+    request: Request,
     sala_id: Optional[UUID] = None,
     esta_resuelta: Optional[bool] = False,
     severidad: Optional[Literal["low", "medium", "high"]] = None,
@@ -61,9 +61,9 @@ async def resolver_alerta(alerta_id: int):
     return respuesta.data[0]
 
 
-@enrutador.get("/resumen")
 @limitador.limit("60/minute")
-async def resumen_alertas(solicitud: Request):
+@enrutador.get("/resumen")
+async def resumen_alertas(request: Request):
     cliente = obtener_cliente()
     respuesta = (
         cliente.table("alerts")

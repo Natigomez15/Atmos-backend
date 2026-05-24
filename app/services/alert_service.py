@@ -4,7 +4,6 @@ from datetime import datetime, timedelta, timezone
 from app.core.database import obtener_cliente
 from app.core.logger import log
 from app.core.websocket_manager import gestor
-from app.services.telegram_service import notificar_alerta
 
 
 def _ahora() -> datetime:

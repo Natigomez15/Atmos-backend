@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 from slowapi.errors import RateLimitExceeded
 from slowapi import _rate_limit_exceeded_handler
 
-from app.api import rooms, nodes, readings, ml, ac_commands, alerts, websockets, telegram
+from app.api import rooms, nodes, readings, ml, ac_commands, alerts, websockets
 from app.core.database import obtener_cliente
 from app.core.limiter import limitador
 from app.core.logger import log
@@ -33,7 +33,6 @@ app.include_router(ml.enrutador, prefix="/api/v1")
 app.include_router(ac_commands.enrutador, prefix="/api/v1")
 app.include_router(alerts.enrutador, prefix="/api/v1")
 app.include_router(websockets.enrutador, prefix="/api/v1")
-app.include_router(telegram.enrutador, prefix="/api/v1")
 
 
 @app.on_event("startup")

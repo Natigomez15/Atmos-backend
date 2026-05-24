@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from app.core.database import obtener_cliente
 from app.core.logger import log
 from app.core.websocket_manager import gestor
+from app.services.telegram_service import notificar_alerta
 
 
 def _ahora() -> datetime:
@@ -88,20 +89,29 @@ class ServicioAlertas:
             ):
                 continue
 
+            mensaje_alerta = (
+                f"El nodo {nodo['direccion_mac']} no ha enviado datos "
+                "en más de 10 minutos"
+            )
+            detalle_alerta = {
+                "ultima_vez_visto": nodo.get("ultima_vez_visto"),
+                "version_firmware": nodo.get("version_firmware"),
+            }
             alerta = self._insertar_alerta(cliente, {
                 "sala_id":     nodo["sala_id"],
                 "nodo_id":     nodo["id"],
                 "tipo_alerta": "node_offline",
                 "severidad":   "high",
-                "mensaje":     (
-                    f"El nodo {nodo['direccion_mac']} no ha enviado datos "
-                    "en más de 10 minutos"
-                ),
-                "detalle": {
-                    "ultima_vez_visto":  nodo.get("ultima_vez_visto"),
-                    "version_firmware":  nodo.get("version_firmware"),
-                },
+                "mensaje":     mensaje_alerta,
+                "detalle":     detalle_alerta,
             })
+            notificar_alerta(
+                tipo_alerta="node_offline",
+                severidad="high",
+                mensaje=mensaje_alerta,
+                sala_id=str(nodo["sala_id"]),
+                detalle=detalle_alerta,
+            )
             alertas_creadas.append(alerta)
 
         return alertas_creadas
@@ -181,21 +191,30 @@ class ServicioAlertas:
             )
             nombre_sala = resp_sala.data["nombre"] if resp_sala.data else sala_id
 
+            mensaje_alerta = (
+                f"La sala {nombre_sala} consume {exceso_pct:.1f}% "
+                "por encima de su promedio histórico"
+            )
+            detalle_alerta = {
+                "potencia_actual_w": round(potencia_actual, 2),
+                "potencia_base_w":   round(potencia_base, 2),
+                "exceso_pct":        round(exceso_pct, 2),
+            }
             alerta = self._insertar_alerta(cliente, {
                 "sala_id":     sala_id,
                 "nodo_id":     None,
                 "tipo_alerta": "power_anomaly",
                 "severidad":   "medium",
-                "mensaje":     (
-                    f"La sala {nombre_sala} consume {exceso_pct:.1f}% "
-                    "por encima de su promedio histórico"
-                ),
-                "detalle": {
-                    "potencia_actual_w":  round(potencia_actual, 2),
-                    "potencia_base_w":    round(potencia_base, 2),
-                    "exceso_pct":         round(exceso_pct, 2),
-                },
+                "mensaje":     mensaje_alerta,
+                "detalle":     detalle_alerta,
             })
+            notificar_alerta(
+                tipo_alerta="power_anomaly",
+                severidad="medium",
+                mensaje=mensaje_alerta,
+                sala_id=str(sala_id),
+                detalle=detalle_alerta,
+            )
             alertas_creadas.append(alerta)
 
         return alertas_creadas
@@ -263,24 +282,33 @@ class ServicioAlertas:
             )
             nombre_sala = resp_sala.data["nombre"] if resp_sala.data else sala_id
 
+            mensaje_alerta = (
+                f"El AC de la sala {nombre_sala} está encendido "
+                "pero la temperatura no baja"
+            )
+            detalle_alerta = {
+                "temperatura_promedio": round(
+                    sum(temperaturas) / len(temperaturas), 2
+                ),
+                "setpoint_ac":     setpoint,
+                "ventana_minutos": 30,
+                "razon_presencia": round(razon_presencia, 2),
+            }
             alerta = self._insertar_alerta(cliente, {
                 "sala_id":     sala_id,
                 "nodo_id":     None,
                 "tipo_alerta": "temperature_stuck",
                 "severidad":   "medium",
-                "mensaje":     (
-                    f"El AC de la sala {nombre_sala} está encendido "
-                    "pero la temperatura no baja"
-                ),
-                "detalle": {
-                    "temperatura_promedio": round(
-                        sum(temperaturas) / len(temperaturas), 2
-                    ),
-                    "setpoint_ac":      setpoint,
-                    "ventana_minutos":  30,
-                    "razon_presencia":  round(razon_presencia, 2),
-                },
+                "mensaje":     mensaje_alerta,
+                "detalle":     detalle_alerta,
             })
+            notificar_alerta(
+                tipo_alerta="temperature_stuck",
+                severidad="medium",
+                mensaje=mensaje_alerta,
+                sala_id=str(sala_id),
+                detalle=detalle_alerta,
+            )
             alertas_creadas.append(alerta)
 
         return alertas_creadas

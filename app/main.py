@@ -8,7 +8,7 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded, _rate_limit_exceeded_handler
 
-from app.api import rooms, nodes, readings, ml, ac_commands, alerts, websockets
+from app.api import rooms, nodes, readings, ml, ac_commands, alerts, websockets, telegram
 from app.core.database import obtener_cliente
 from app.core.logger import log
 from app.core.websocket_manager import gestor
@@ -35,6 +35,7 @@ aplicacion.include_router(ml.enrutador, prefix="/api/v1")
 aplicacion.include_router(ac_commands.enrutador, prefix="/api/v1")
 aplicacion.include_router(alerts.enrutador, prefix="/api/v1")
 aplicacion.include_router(websockets.enrutador, prefix="/api/v1")
+aplicacion.include_router(telegram.enrutador, prefix="/api/v1")
 
 
 @aplicacion.on_event("startup")

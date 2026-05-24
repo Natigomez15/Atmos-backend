@@ -15,6 +15,12 @@ class Configuracion(BaseSettings):
     FIREBASE_DATABASE_URL: str
     FIREBASE_STORAGE_BUCKET: str
 
+    # Telegram
+    TELEGRAM_BOT_TOKEN: str = ""
+    WORKING_HOURS_START: int = 7
+    WORKING_HOURS_END: int = 18
+    WORKING_DAYS: str = "0,1,2,3,4,5"
+
     model_config = {"env_file": ".env"}
 
     def firebase_config(self) -> dict:

@@ -82,3 +82,8 @@ async def estado_servicio():
             status_code=503,
             content={"estado": "degradado", "servicio": "atmos-api", "base_de_datos": "inalcanzable"},
         )
+
+
+@app.get("/")
+async def raiz():
+    return {"estado": "ok", "servicio": "ATMOS API"}

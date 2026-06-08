@@ -205,19 +205,35 @@ def leer_ultimas_lecturas_firebase_rest(
     return datos if isinstance(datos, dict) else {}
 
 
+def guardar_registro_supabase_rest(registro: dict) -> dict:
+    supabase_url = configuracion.SUPABASE_URL.strip().strip('"').strip("'").rstrip("/")
+    supabase_key = (
+        configuracion.SUPABASE_KEY
+        .strip()
+        .strip('"')
+        .strip("'")
+        .removeprefix("Bearer ")
+        .strip()
+    )
+    url = f"{supabase_url}/rest/v1/registros?on_conflict=firebase_key"
+    headers = {
+        "apikey": supabase_key,
+        "Authorization": f"Bearer {supabase_key}",
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates,return=representation",
+    }
+    respuesta = httpx.post(url, headers=headers, json=registro, timeout=8)
+    respuesta.raise_for_status()
+    datos = respuesta.json()
+    return datos[0] if isinstance(datos, list) and datos else registro
+
+
 def sincronizar_firebase_supabase(
     pabellon_objetivo: str | None = "robotica",
     aire_objetivo: str | None = "Aire_1",
 ) -> dict:
     inicio_total = time.monotonic()
     etapas: list[dict] = []
-
-    inicio = time.monotonic()
-    supabase = obtener_cliente()
-    etapas.append({
-        "paso": "cliente_supabase",
-        "duracion_ms": round((time.monotonic() - inicio) * 1000, 2),
-    })
 
     if pabellon_objetivo and aire_objetivo:
         inicio = time.monotonic()
@@ -264,8 +280,8 @@ def sincronizar_firebase_supabase(
                     errores += 1
                     continue
 
-                sala_id = resolver_sala_id(supabase, pabellon, aire, valor)
-                nodo_id = resolver_nodo_id(supabase, sala_id, valor)
+                sala_id = _a_uuid(valor.get("sala_id"))
+                nodo_id = _a_uuid(valor.get("nodo_id"))
                 registro = preparar_registro_supabase(
                     pabellon=pabellon,
                     aire=aire,
@@ -277,10 +293,7 @@ def sincronizar_firebase_supabase(
 
                 try:
                     inicio = time.monotonic()
-                    supabase.table("registros").upsert(
-                        registro,
-                        on_conflict="firebase_key",
-                    ).execute()
+                    guardar_registro_supabase_rest(registro)
                     etapas.append({
                         "paso": "upsert_supabase",
                         "firebase_key": registro["firebase_key"],

@@ -189,16 +189,20 @@ def sincronizar_firebase_supabase(
     supabase = obtener_cliente()
 
     if pabellon_objetivo and aire_objetivo:
+        lecturas = (
+            firebase_db.child("Atmos")
+            .child("registro")
+            .child(pabellon_objetivo)
+            .child(aire_objetivo)
+            .child("lecturas")
+            .order_by_key()
+            .limit_to_last(1)
+            .get()
+            .val()
+        )
         datos = {
             pabellon_objetivo: {
-                aire_objetivo: (
-                    firebase_db.child("Atmos")
-                    .child("registro")
-                    .child(pabellon_objetivo)
-                    .child(aire_objetivo)
-                    .get()
-                    .val()
-                )
+                aire_objetivo: {"lecturas": lecturas or {}}
             }
         }
     else:

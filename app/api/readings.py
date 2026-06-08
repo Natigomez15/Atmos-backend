@@ -235,7 +235,7 @@ async def crear_registro(registro: RegistroCrear):
 
 @limitador.limit("30/minute")
 @enrutador.post("/firebase/sincronizar")
-async def sincronizar_registros_firebase(
+def sincronizar_registros_firebase(
     request: Request,
     x_atmos_token: Annotated[Optional[str], Header()] = None,
     pabellon: str = "robotica",
@@ -263,7 +263,7 @@ async def sincronizar_registros_firebase(
 
 
 @enrutador.get("/firebase/ultima")
-async def obtener_ultima_lectura_firebase(
+def obtener_ultima_lectura_firebase(
     pabellon: str = "robotica",
     aire: str = "Aire_1",
 ):
@@ -285,7 +285,7 @@ async def obtener_ultima_lectura_firebase(
 
 
 @enrutador.post("/firebase/sincronizar-rapido")
-async def sincronizar_registros_firebase_rapido(
+def sincronizar_registros_firebase_rapido(
     x_atmos_token: Annotated[Optional[str], Header()] = None,
     pabellon: str = "robotica",
     aire: str = "Aire_1",

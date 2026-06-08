@@ -1,10 +1,10 @@
 import time
-import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlencode
-from urllib.request import urlopen
 from uuid import UUID
+
+import httpx
 
 from app.config import configuracion
 from app.core.database import obtener_cliente, obtener_firebase
@@ -198,10 +198,10 @@ def leer_ultimas_lecturas_firebase_rest(
     })
     url = f"{database_url}/{ruta}?{parametros}"
 
-    with urlopen(url, timeout=10) as respuesta:
-        contenido = respuesta.read().decode("utf-8")
+    respuesta = httpx.get(url, timeout=8)
+    respuesta.raise_for_status()
 
-    datos = json.loads(contenido) if contenido else None
+    datos = respuesta.json()
     return datos if isinstance(datos, dict) else {}
 
 
@@ -209,14 +209,28 @@ def sincronizar_firebase_supabase(
     pabellon_objetivo: str | None = "robotica",
     aire_objetivo: str | None = "Aire_1",
 ) -> dict:
+    inicio_total = time.monotonic()
+    etapas: list[dict] = []
+
+    inicio = time.monotonic()
     supabase = obtener_cliente()
+    etapas.append({
+        "paso": "cliente_supabase",
+        "duracion_ms": round((time.monotonic() - inicio) * 1000, 2),
+    })
 
     if pabellon_objetivo and aire_objetivo:
+        inicio = time.monotonic()
         lecturas = leer_ultimas_lecturas_firebase_rest(
             pabellon=pabellon_objetivo,
             aire=aire_objetivo,
             limite=1,
         )
+        etapas.append({
+            "paso": "leer_firebase_rest",
+            "duracion_ms": round((time.monotonic() - inicio) * 1000, 2),
+            "cantidad_lecturas": len(lecturas),
+        })
         datos = {
             pabellon_objetivo: {
                 aire_objetivo: {"lecturas": lecturas or {}}
@@ -262,10 +276,16 @@ def sincronizar_firebase_supabase(
                 )
 
                 try:
+                    inicio = time.monotonic()
                     supabase.table("registros").upsert(
                         registro,
                         on_conflict="firebase_key",
                     ).execute()
+                    etapas.append({
+                        "paso": "upsert_supabase",
+                        "firebase_key": registro["firebase_key"],
+                        "duracion_ms": round((time.monotonic() - inicio) * 1000, 2),
+                    })
                     sincronizados += 1
                 except Exception as error:
                     errores += 1
@@ -275,6 +295,8 @@ def sincronizar_firebase_supabase(
         "sincronizados": sincronizados,
         "errores": errores,
         "detalles_errores": detalles_errores[:10],
+        "etapas": etapas,
+        "duracion_total_ms": round((time.monotonic() - inicio_total) * 1000, 2),
     }
 
 

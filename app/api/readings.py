@@ -14,6 +14,7 @@ from app.core.database import obtener_cliente
 from app.core.logger import log
 from app.core.websocket_manager import gestor
 from app.services.aggregation import agregar_lecturas, ServicioAgregacion
+from app.services.sincronizador_firebase import sincronizar_firebase_supabase
 from app.config import configuracion
 from app.core.limiter import limitador
 
@@ -194,3 +195,21 @@ async def crear_registro(registro: RegistroCrear):
     if not respuesta.data:
         raise HTTPException(status_code=400, detail="Error al insertar el registro")
     return respuesta.data[0]
+
+
+@limitador.limit("30/minute")
+@enrutador.post("/firebase/sincronizar")
+async def sincronizar_registros_firebase(
+    request: Request,
+    x_atmos_token: Annotated[Optional[str], Header()] = None,
+):
+    if not configuracion.ATMOS_DEVICE_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="ATMOS_DEVICE_TOKEN no está configurado en el servidor",
+        )
+
+    if x_atmos_token != configuracion.ATMOS_DEVICE_TOKEN:
+        raise HTTPException(status_code=401, detail="Token ATMOS inválido")
+
+    return sincronizar_firebase_supabase()

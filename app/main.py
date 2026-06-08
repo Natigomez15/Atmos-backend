@@ -89,3 +89,8 @@ async def estado_servicio():
 @app.get("/")
 async def raiz():
     return {"estado": "ok", "servicio": "ATMOS API"}
+
+
+@app.head("/")
+async def raiz_head():
+    return Response(status_code=200)

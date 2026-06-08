@@ -153,3 +153,29 @@ async def test_evaluar_predicciones_secreto_invalido(
     )
 
     assert respuesta.status_code == 401
+
+
+async def test_decidir_atmos_firebase_requiere_token(cliente_prueba):
+    respuesta = await cliente_prueba.post(
+        "/api/v1/ml/atmos/firebase/decidir",
+        json={"area": "robotica", "aire": "Aire_1"},
+    )
+
+    assert respuesta.status_code == 401
+
+
+async def test_decidir_atmos_firebase_token_valido(cliente_prueba):
+    with patch("app.api.ml.ServicioPredictor") as mock_servicio:
+        mock_servicio.return_value.decidir_atmos_desde_firebase.return_value = {
+            "accion": "apagar",
+            "ruta_accion": "/Atmos/comandos/robotica/Aire_1/accion",
+        }
+
+        respuesta = await cliente_prueba.post(
+            "/api/v1/ml/atmos/firebase/decidir",
+            json={"area": "robotica", "aire": "Aire_1"},
+            headers={"X-Atmos-Token": "atmos-device-test"},
+        )
+
+    assert respuesta.status_code == 200
+    assert respuesta.json()["accion"] == "apagar"

@@ -1,10 +1,248 @@
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
+from functools import lru_cache
+from pathlib import Path
 from uuid import UUID
+from zoneinfo import ZoneInfo
+
+import joblib
 
 from app.core.database import obtener_cliente
+from app.core.database import obtener_firebase
+from app.ml.atmos_logic import ejecutar_atmos
+
+
+MODELO_ATMOS_PATH = Path(__file__).with_name("modelo_atmos (1).pkl")
+ZONA_HORARIA_ATMOS = ZoneInfo("America/Panama")
+HORA_INICIO_OPERACION = time(7, 0)
+HORA_FIN_OPERACION = time(22, 45)
+
+
+@lru_cache(maxsize=1)
+def cargar_modelo_atmos():
+    return joblib.load(MODELO_ATMOS_PATH)
 
 
 class ServicioPredictor:
+
+    # -----------------------------------------------------------------------
+    # Modelo ATMOS en tiempo real
+    # -----------------------------------------------------------------------
+
+    def decidir_atmos(self, datos: dict) -> dict:
+        sala_id = datos.pop("sala_id", None)
+        nodo_id = datos.pop("nodo_id", None)
+
+        if datos.get("presencia") == 1:
+            datos["minutos_sin_presencia"] = 0
+        elif sala_id or nodo_id:
+            minutos = self.calcular_minutos_sin_presencia(sala_id, nodo_id)
+            if minutos is not None:
+                datos["minutos_sin_presencia"] = minutos
+
+        modelo = cargar_modelo_atmos()
+        return ejecutar_atmos(modelo, **datos)
+
+    def decidir_atmos_desde_firebase(
+        self, area: str = "robotica", aire: str = "Aire_1"
+    ) -> dict:
+        firebase_db = obtener_firebase()
+        lectura = self.obtener_ultima_lectura_firebase(firebase_db, area, aire)
+        datos_atmos = self.preparar_lectura_firebase(lectura)
+        horario = self.obtener_estado_horario_operacion()
+
+        if horario["dentro_horario"]:
+            resultado = self.decidir_atmos(datos_atmos)
+            accion = self.traducir_accion_esp32(resultado)
+        else:
+            resultado = None
+            accion = "apagar"
+
+        firebase_db.child("Atmos").child("comandos").child(area).child(aire).update({
+            "accion": accion,
+        })
+
+        return {
+            "lectura_firebase": lectura,
+            "entrada_modelo": datos_atmos,
+            "resultado_modelo": resultado,
+            "accion": accion,
+            "horario": horario,
+            "ruta_accion": f"/Atmos/comandos/{area}/{aire}/accion",
+        }
+
+    def obtener_estado_horario_operacion(self, ahora: datetime | None = None) -> dict:
+        ahora = ahora or datetime.now(ZONA_HORARIA_ATMOS)
+        if ahora.tzinfo is None:
+            ahora = ahora.replace(tzinfo=ZONA_HORARIA_ATMOS)
+        else:
+            ahora = ahora.astimezone(ZONA_HORARIA_ATMOS)
+
+        hora_actual = ahora.time().replace(microsecond=0)
+        dentro_horario = HORA_INICIO_OPERACION <= hora_actual < HORA_FIN_OPERACION
+
+        return {
+            "zona_horaria": "America/Panama",
+            "hora_actual": hora_actual.isoformat(timespec="minutes"),
+            "hora_inicio": HORA_INICIO_OPERACION.isoformat(timespec="minutes"),
+            "hora_fin": HORA_FIN_OPERACION.isoformat(timespec="minutes"),
+            "dentro_horario": dentro_horario,
+            "motivo": (
+                "Horario permitido para ejecutar el modelo ML."
+                if dentro_horario
+                else "Fuera de horario permitido. Se fuerza accion apagar."
+            ),
+        }
+
+    def obtener_ultima_lectura_firebase(self, firebase_db, area: str, aire: str) -> dict:
+        respuesta = (
+            firebase_db.child("Atmos")
+            .child("registro")
+            .child(area)
+            .child(aire)
+            .child("lecturas")
+            .order_by_key()
+            .limit_to_last(1)
+            .get()
+            .val()
+        )
+
+        if not respuesta:
+            raise ValueError(f"No hay lecturas en /Atmos/registro/{area}/{aire}/lecturas")
+
+        if isinstance(respuesta, dict):
+            return list(respuesta.values())[-1]
+
+        if isinstance(respuesta, list):
+            lecturas = [lectura for lectura in respuesta if lectura]
+            if lecturas:
+                return lecturas[-1]
+
+        raise ValueError("La última lectura de Firebase no tiene un formato válido")
+
+    def preparar_lectura_firebase(self, lectura: dict) -> dict:
+        def buscar(*claves, requerido: bool = True, defecto=None):
+            for clave in claves:
+                if clave in lectura and lectura[clave] is not None:
+                    return lectura[clave]
+            if requerido:
+                raise ValueError(f"Falta un campo requerido en Firebase: {claves[0]}")
+            return defecto
+
+        presencia_raw = buscar(
+            "presencia",
+            "ocupacion",
+            "ocupado",
+            "estado_ocupacion",
+            "movimiento",
+            requerido=False,
+            defecto=0,
+        )
+        presencia_texto = str(presencia_raw).strip().lower()
+        presencia = 1 if presencia_raw is True or presencia_texto in {
+            "1",
+            "true",
+            "si",
+            "sí",
+            "ocupado",
+            "detectado",
+            "presente",
+        } else 0
+
+        temp_ambiente = float(buscar(
+            "temp_ambiente",
+            "temperatura_ambiente",
+            "temperatura",
+            "temperatura_dht11",
+        ))
+
+        temp_ac_raw = buscar(
+            "temp_ac",
+            "temperatura_ac",
+            "temperatura_salida",
+            "temperatura_salida_aire",
+            "temperatura_ds18b20",
+            requerido=False,
+            defecto=None,
+        )
+        if temp_ac_raw is None:
+            delta_t = float(buscar("delta_t"))
+            temp_ac = temp_ambiente - delta_t
+        else:
+            temp_ac = float(temp_ac_raw)
+
+        return {
+            "presencia": presencia,
+            "temp_ambiente": temp_ambiente,
+            "temp_ac": temp_ac,
+            "humedad": float(buscar("humedad")),
+            "minutos_sin_presencia": int(buscar(
+                "minutos_sin_presencia",
+                requerido=False,
+                defecto=0,
+            )),
+            "minutos_enfriando": int(buscar(
+                "minutos_enfriando",
+                requerido=False,
+                defecto=0,
+            )),
+            "temp_inicio": buscar("temp_inicio", requerido=False, defecto=None),
+            "temp_actual": buscar("temp_actual", requerido=False, defecto=None),
+            "temp_ac_actual": buscar("temp_ac_actual", requerido=False, defecto=None),
+            "usar_capa_seguridad": True,
+        }
+
+    def traducir_accion_esp32(self, resultado: dict) -> str:
+        decision = resultado["control"]["decision_final"]
+        accion_ac = resultado["control"]["accion_ac"]
+        temperatura_objetivo = accion_ac.get("temperatura_objetivo")
+
+        if decision == "apagar":
+            return "apagar"
+
+        if decision == "esperar_apagado":
+            return "mantener"
+
+        if decision == "mantener":
+            return "ahorro_24" if temperatura_objetivo == 24 else "mantener"
+
+        if decision == "enfriar_fuerte":
+            return "encender_22" if temperatura_objetivo == 22 else "enfriar_fuerte"
+
+        return "mantener"
+
+    def calcular_minutos_sin_presencia(
+        self, sala_id: UUID | str | None = None, nodo_id: UUID | str | None = None
+    ) -> int | None:
+        cliente = obtener_cliente()
+        consulta = (
+            cliente.table("sensor_readings")
+            .select("registrado_en")
+            .eq("presencia", True)
+            .order("registrado_en", desc=True)
+            .limit(1)
+        )
+
+        if sala_id:
+            consulta = consulta.eq("sala_id", str(sala_id))
+        if nodo_id:
+            consulta = consulta.eq("nodo_id", str(nodo_id))
+
+        respuesta = consulta.execute()
+        if not respuesta.data:
+            return None
+
+        ultimo_registro = respuesta.data[0].get("registrado_en")
+        if not ultimo_registro:
+            return None
+
+        ultima_presencia = datetime.fromisoformat(
+            ultimo_registro.replace("Z", "+00:00")
+        )
+        if ultima_presencia.tzinfo is None:
+            ultima_presencia = ultima_presencia.replace(tzinfo=timezone.utc)
+
+        diferencia = datetime.now(timezone.utc) - ultima_presencia
+        return max(0, int(diferencia.total_seconds() // 60))
 
     # -----------------------------------------------------------------------
     # Características de entrenamiento

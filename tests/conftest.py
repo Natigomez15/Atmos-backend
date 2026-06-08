@@ -4,6 +4,7 @@ import os
 os.environ.setdefault("SUPABASE_URL", "https://test.supabase.co")
 os.environ.setdefault("SUPABASE_KEY", "clave-test-123")
 os.environ.setdefault("CRON_SECRET", "secreto_cron_prueba")
+os.environ.setdefault("ATMOS_DEVICE_TOKEN", "atmos-device-test")
 os.environ.setdefault("FIREBASE_API_KEY", "test-firebase-key")
 os.environ.setdefault("FIREBASE_AUTH_DOMAIN", "test-proyecto.firebaseapp.com")
 os.environ.setdefault("FIREBASE_DATABASE_URL", "https://test-proyecto-default-rtdb.firebaseio.com/")

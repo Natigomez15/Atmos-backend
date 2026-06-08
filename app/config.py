@@ -1,3 +1,5 @@
+import os
+
 from pydantic_settings import BaseSettings
 
 
@@ -8,6 +10,7 @@ class Configuracion(BaseSettings):
 
     # Cron
     CRON_SECRET: str = ""
+    ATMOS_DEVICE_TOKEN: str = ""
 
     # Firebase
     FIREBASE_API_KEY: str = ""
@@ -15,7 +18,12 @@ class Configuracion(BaseSettings):
     FIREBASE_DATABASE_URL: str = ""
     FIREBASE_STORAGE_BUCKET: str = ""
 
-    model_config = {"env_file": ".env"}
+    # VAPID — notificaciones push
+    vapid_clave_privada: str = ""
+    vapid_clave_publica: str = ""
+    vapid_correo:        str = ""
+
+    model_config = {"env_file": None if os.getenv("SUPABASE_URL") else ".env"}
 
     def firebase_config(self) -> dict:
         return {

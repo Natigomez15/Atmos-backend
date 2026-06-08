@@ -128,10 +128,16 @@ def preparar_registro_supabase(
     nodo_id: str | None = None,
 ) -> dict:
     temperatura_ambiente = _a_numero(
-        valor.get("temperatura_ambiente", valor.get("temperatura"))
+        valor.get(
+            "temperatura_ambiente",
+            valor.get("temperatura", valor.get("temperatura_dht11")),
+        )
     )
     temperatura_salida_aire = _a_numero(
-        valor.get("temperatura_salida_aire", valor.get("temperatura_ac"))
+        valor.get(
+            "temperatura_salida_aire",
+            valor.get("temperatura_ac", valor.get("temperatura_ds18b20")),
+        )
     )
     delta_t = _a_numero(
         valor.get("delta_t"),

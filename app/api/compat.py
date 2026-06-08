@@ -109,9 +109,35 @@ async def obtener_reading_reciente(sala_id: UUID):
         .limit(1)
         .execute()
     )
-    if not respuesta.data:
-        raise HTTPException(status_code=404, detail="No hay lecturas para esta sala")
-    return _mapear_registro_a_reading(respuesta.data[0])
+    if respuesta.data:
+        return _mapear_registro_a_reading(respuesta.data[0])
+
+    sala_respuesta = (
+        cliente.table("rooms")
+        .select("nombre,pabellon,edificio")
+        .eq("id", str(sala_id))
+        .limit(1)
+        .execute()
+    )
+    if sala_respuesta.data:
+        sala = sala_respuesta.data[0]
+        pabellon = sala.get("pabellon") or sala.get("edificio")
+        aire = sala.get("nombre")
+        if pabellon and aire:
+            respuesta = (
+                cliente.table("registros")
+                .select("*")
+                .eq("pabellon", pabellon)
+                .eq("aire", aire)
+                .order("fecha_sync", desc=True)
+                .limit(1)
+                .execute()
+            )
+            if respuesta.data:
+                registro = {**respuesta.data[0], "sala_id": str(sala_id)}
+                return _mapear_registro_a_reading(registro)
+
+    raise HTTPException(status_code=404, detail="No hay lecturas para esta sala")
 
 
 @enrutador.get("/readings")

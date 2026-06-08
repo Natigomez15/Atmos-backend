@@ -15,6 +15,7 @@ from app.core.logger import log
 from app.core.websocket_manager import gestor
 from app.services.aggregation import agregar_lecturas, ServicioAgregacion
 from app.services.sincronizador_firebase import sincronizar_firebase_supabase
+from app.services.sincronizador_firebase import leer_ultimas_lecturas_firebase_rest
 from app.config import configuracion
 from app.core.limiter import limitador
 
@@ -248,6 +249,55 @@ async def sincronizar_registros_firebase(
 
     if x_atmos_token != configuracion.ATMOS_DEVICE_TOKEN:
         raise HTTPException(status_code=401, detail="Token ATMOS inválido")
+
+    try:
+        return sincronizar_firebase_supabase(
+            pabellon_objetivo=pabellon,
+            aire_objetivo=aire,
+        )
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error sincronizando Firebase con Supabase: {error}",
+        )
+
+
+@enrutador.get("/firebase/ultima")
+async def obtener_ultima_lectura_firebase(
+    pabellon: str = "robotica",
+    aire: str = "Aire_1",
+):
+    try:
+        return {
+            "pabellon": pabellon,
+            "aire": aire,
+            "lecturas": leer_ultimas_lecturas_firebase_rest(
+                pabellon=pabellon,
+                aire=aire,
+                limite=1,
+            ),
+        }
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error leyendo Firebase por REST: {error}",
+        )
+
+
+@enrutador.post("/firebase/sincronizar-rapido")
+async def sincronizar_registros_firebase_rapido(
+    x_atmos_token: Annotated[Optional[str], Header()] = None,
+    pabellon: str = "robotica",
+    aire: str = "Aire_1",
+):
+    if not configuracion.ATMOS_DEVICE_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="ATMOS_DEVICE_TOKEN no esta configurado en el servidor",
+        )
+
+    if x_atmos_token != configuracion.ATMOS_DEVICE_TOKEN:
+        raise HTTPException(status_code=401, detail="Token ATMOS invalido")
 
     try:
         return sincronizar_firebase_supabase(

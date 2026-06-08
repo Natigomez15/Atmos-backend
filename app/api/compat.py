@@ -47,9 +47,15 @@ def _mapear_sala(sala: dict) -> dict:
 
 @enrutador.get("/rooms")
 async def listar_rooms():
-    cliente = obtener_cliente()
-    respuesta = cliente.table("rooms").select("*").order("nombre", desc=False).execute()
-    return [_mapear_sala(sala) for sala in respuesta.data]
+    try:
+        cliente = obtener_cliente()
+        respuesta = cliente.table("rooms").select("*").order("nombre", desc=False).execute()
+        return [_mapear_sala(sala) for sala in respuesta.data or []]
+    except Exception as error:
+        raise HTTPException(
+            status_code=503,
+            detail=f"No se pudo leer rooms desde Supabase: {error}",
+        )
 
 
 @enrutador.post("/rooms", status_code=201)

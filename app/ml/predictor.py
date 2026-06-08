@@ -2,7 +2,6 @@ from datetime import datetime, time, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from uuid import UUID
-from zoneinfo import ZoneInfo
 
 import joblib
 
@@ -12,7 +11,7 @@ from app.ml.atmos_logic import ejecutar_atmos
 
 
 MODELO_ATMOS_PATH = Path(__file__).with_name("modelo_atmos (1).pkl")
-ZONA_HORARIA_ATMOS = ZoneInfo("America/Panama")
+ZONA_HORARIA_ATMOS = timezone(timedelta(hours=-5), "America/Panama")
 HORA_INICIO_OPERACION = time(7, 0)
 HORA_FIN_OPERACION = time(22, 45)
 

@@ -1,6 +1,6 @@
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from datetime import datetime
-from typing import Optional, Literal
+from typing import Optional, Literal, List
 from uuid import UUID
 import re
 
@@ -10,18 +10,30 @@ import re
 # ---------------------------------------------------------------------------
 
 class RegistroCrear(BaseModel):
-    sensor: str
-    temperatura_dht11: Optional[float] = None
-    temperatura_ds18b20: Optional[float] = None
+    firebase_key: str
+    sala_id: Optional[UUID] = None
+    nodo_id: Optional[UUID] = None
+    pabellon: Optional[str] = None
+    aire: Optional[str] = None
+    temperatura_ambiente: Optional[float] = None
     humedad: Optional[float] = None
+    temperatura_salida_aire: Optional[float] = None
+    delta_t: Optional[float] = None
     movimiento: Optional[int] = None
-    fecha: Optional[datetime] = None
+    potencia_w: Optional[float] = None
+    energia_kwh: Optional[float] = None
+    estado_ocupacion: Optional[bool] = None
+    recomendacion_local: Optional[str] = None
+    control_ir_activo: Optional[bool] = None
+    aire_encendido_atmos: Optional[bool] = None
+    ultima_accion_ejecutada: Optional[str] = None
+    fecha_sync: Optional[datetime] = None
 
 
 class RegistroRespuesta(RegistroCrear):
     model_config = ConfigDict(from_attributes=True)
 
-    id: int
+    id: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -163,3 +175,36 @@ class AlertaRespuesta(BaseModel):
     esta_resuelta: bool
     creado_en: datetime
     resuelto_en: Optional[datetime] = None
+
+
+# ---------------------------------------------------------------------------
+# Suscripciones push (PWA)
+# ---------------------------------------------------------------------------
+
+class SuscripcionPushCrear(BaseModel):
+    endpoint:     str
+    clave_p256dh: str
+    clave_auth:   str
+    # días separados por coma: 0=lunes, 6=domingo
+    dias_activos: str = "0,1,2,3,4"
+    hora_inicio:  int = Field(7,  ge=0, le=23)
+    hora_fin:     int = Field(18, ge=0, le=23)
+
+
+class SuscripcionPushRespuesta(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id:           int
+    endpoint:     str
+    dias_activos: str
+    hora_inicio:  int
+    hora_fin:     int
+    esta_activa:  bool
+    creado_en:    datetime
+
+
+class ActualizarHorarioNotificaciones(BaseModel):
+    dias_activos: Optional[str]  = None
+    hora_inicio:  Optional[int]  = None
+    hora_fin:     Optional[int]  = None
+    esta_activa:  Optional[bool] = None

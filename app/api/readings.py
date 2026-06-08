@@ -167,25 +167,60 @@ async def disparar_agregacion(
 # ---------------------------------------------------------------------------
 
 @enrutador.get("/registros", response_model=list[RegistroRespuesta])
-async def listar_registros(sensor: str | None = None, limite: int = 100):
+async def listar_registros(
+    pabellon: str | None = None,
+    aire: str | None = None,
+    limite: Annotated[int, Query(ge=1, le=1000)] = 100,
+):
     cliente = obtener_cliente()
     consulta = (
-        cliente.table("registros").select("*").limit(limite).order("fecha", desc=True)
+        cliente.table("registros")
+        .select("*")
+        .limit(limite)
+        .order("fecha_sync", desc=True)
     )
-    if sensor:
-        consulta = consulta.eq("sensor", sensor)
+    if pabellon:
+        consulta = consulta.eq("pabellon", pabellon)
+    if aire:
+        consulta = consulta.eq("aire", aire)
     respuesta = consulta.execute()
     return respuesta.data
 
 
 @enrutador.get("/registros/agregado")
-async def obtener_agregado(sensor: str | None = None):
+async def obtener_agregado(pabellon: str | None = None, aire: str | None = None):
     cliente = obtener_cliente()
     consulta = cliente.table("registros").select("*")
-    if sensor:
-        consulta = consulta.eq("sensor", sensor)
+    if pabellon:
+        consulta = consulta.eq("pabellon", pabellon)
+    if aire:
+        consulta = consulta.eq("aire", aire)
     respuesta = consulta.execute()
     return agregar_lecturas(respuesta.data)
+
+
+@enrutador.get("/registros/reciente", response_model=RegistroRespuesta)
+async def obtener_registro_reciente(
+    sala_id: UUID | None = None,
+    pabellon: str = "robotica",
+    aire: str = "Aire_1",
+):
+    cliente = obtener_cliente()
+    consulta = (
+        cliente.table("registros")
+        .select("*")
+        .order("fecha_sync", desc=True)
+        .limit(1)
+    )
+    if sala_id:
+        consulta = consulta.eq("sala_id", str(sala_id))
+    else:
+        consulta = consulta.eq("pabellon", pabellon).eq("aire", aire)
+
+    respuesta = consulta.execute()
+    if not respuesta.data:
+        raise HTTPException(status_code=404, detail="No hay registros sincronizados")
+    return respuesta.data[0]
 
 
 @enrutador.post("/registros", response_model=RegistroRespuesta, status_code=201)

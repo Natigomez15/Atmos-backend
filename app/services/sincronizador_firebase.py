@@ -181,16 +181,35 @@ def preparar_registro_supabase(
     }
 
 
-def sincronizar_firebase_supabase() -> dict:
+def sincronizar_firebase_supabase(
+    pabellon_objetivo: str | None = "robotica",
+    aire_objetivo: str | None = "Aire_1",
+) -> dict:
     firebase_db = obtener_firebase()
     supabase = obtener_cliente()
-    datos = firebase_db.child("Atmos").child("registro").get().val()
+
+    if pabellon_objetivo and aire_objetivo:
+        datos = {
+            pabellon_objetivo: {
+                aire_objetivo: (
+                    firebase_db.child("Atmos")
+                    .child("registro")
+                    .child(pabellon_objetivo)
+                    .child(aire_objetivo)
+                    .get()
+                    .val()
+                )
+            }
+        }
+    else:
+        datos = firebase_db.child("Atmos").child("registro").get().val()
 
     if not datos:
         return {"sincronizados": 0, "errores": 0, "mensaje": "No hay datos en Firebase."}
 
     sincronizados = 0
     errores = 0
+    detalles_errores: list[str] = []
 
     for pabellon, aires in datos.items():
         if not isinstance(aires, dict):
@@ -226,10 +245,15 @@ def sincronizar_firebase_supabase() -> dict:
                         on_conflict="firebase_key",
                     ).execute()
                     sincronizados += 1
-                except Exception:
+                except Exception as error:
                     errores += 1
+                    detalles_errores.append(f"{registro['firebase_key']}: {error}")
 
-    return {"sincronizados": sincronizados, "errores": errores}
+    return {
+        "sincronizados": sincronizados,
+        "errores": errores,
+        "detalles_errores": detalles_errores[:10],
+    }
 
 
 def sincronizar(intervalo_segundos: int = 15):

@@ -237,6 +237,8 @@ async def crear_registro(registro: RegistroCrear):
 async def sincronizar_registros_firebase(
     request: Request,
     x_atmos_token: Annotated[Optional[str], Header()] = None,
+    pabellon: str = "robotica",
+    aire: str = "Aire_1",
 ):
     if not configuracion.ATMOS_DEVICE_TOKEN:
         raise HTTPException(
@@ -247,4 +249,13 @@ async def sincronizar_registros_firebase(
     if x_atmos_token != configuracion.ATMOS_DEVICE_TOKEN:
         raise HTTPException(status_code=401, detail="Token ATMOS inválido")
 
-    return sincronizar_firebase_supabase()
+    try:
+        return sincronizar_firebase_supabase(
+            pabellon_objetivo=pabellon,
+            aire_objetivo=aire,
+        )
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error sincronizando Firebase con Supabase: {error}",
+        )

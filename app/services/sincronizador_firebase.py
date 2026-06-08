@@ -1,8 +1,12 @@
 import time
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlencode
+from urllib.request import urlopen
 from uuid import UUID
 
+from app.config import configuracion
 from app.core.database import obtener_cliente, obtener_firebase
 
 
@@ -181,6 +185,26 @@ def preparar_registro_supabase(
     }
 
 
+def leer_ultimas_lecturas_firebase_rest(
+    pabellon: str,
+    aire: str,
+    limite: int = 1,
+) -> dict:
+    database_url = configuracion.FIREBASE_DATABASE_URL.rstrip("/")
+    ruta = f"Atmos/registro/{pabellon}/{aire}/lecturas.json"
+    parametros = urlencode({
+        "orderBy": '"$key"',
+        "limitToLast": limite,
+    })
+    url = f"{database_url}/{ruta}?{parametros}"
+
+    with urlopen(url, timeout=10) as respuesta:
+        contenido = respuesta.read().decode("utf-8")
+
+    datos = json.loads(contenido) if contenido else None
+    return datos if isinstance(datos, dict) else {}
+
+
 def sincronizar_firebase_supabase(
     pabellon_objetivo: str | None = "robotica",
     aire_objetivo: str | None = "Aire_1",
@@ -189,16 +213,10 @@ def sincronizar_firebase_supabase(
     supabase = obtener_cliente()
 
     if pabellon_objetivo and aire_objetivo:
-        lecturas = (
-            firebase_db.child("Atmos")
-            .child("registro")
-            .child(pabellon_objetivo)
-            .child(aire_objetivo)
-            .child("lecturas")
-            .order_by_key()
-            .limit_to_last(1)
-            .get()
-            .val()
+        lecturas = leer_ultimas_lecturas_firebase_rest(
+            pabellon=pabellon_objetivo,
+            aire=aire_objetivo,
+            limite=1,
         )
         datos = {
             pabellon_objetivo: {

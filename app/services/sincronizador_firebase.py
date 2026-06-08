@@ -12,7 +12,16 @@ def _a_booleano(valor: Any) -> bool:
     if isinstance(valor, bool):
         return valor
     texto = str(valor).strip().lower()
-    return texto in {"1", "true", "si", "sí", "ocupado", "detectado", "presente"}
+    return texto in {
+        "1",
+        "true",
+        "si",
+        "sí",
+        "ocupado",
+        "con_ocupacion",
+        "detectado",
+        "presente",
+    }
 
 
 def _a_numero(valor: Any, defecto: float = 0.0) -> float:
@@ -62,7 +71,10 @@ def preparar_registro_supabase(
         "estado_ocupacion": _a_booleano(
             valor.get("estado_ocupacion", valor.get("presencia", valor.get("ocupado", 0)))
         ),
-        "recomendacion_local": valor.get("recomendacion_local", ""),
+        "recomendacion_local": valor.get(
+            "recomendacion_local",
+            valor.get("recomendacion", ""),
+        ),
         "control_ir_activo": _a_booleano(valor.get("control_ir_activo", False)),
         "aire_encendido_atmos": (
             None

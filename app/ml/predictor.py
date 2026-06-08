@@ -51,7 +51,11 @@ class ServicioPredictor:
 
         if horario["dentro_horario"]:
             resultado = self.decidir_atmos(datos_atmos)
-            accion = self.traducir_accion_esp32(resultado)
+            accion = (
+                self.traducir_accion_esp32(resultado)
+                if resultado.get("valido")
+                else "mantener"
+            )
         else:
             resultado = None
             accion = "apagar"

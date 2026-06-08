@@ -209,7 +209,6 @@ def sincronizar_firebase_supabase(
     pabellon_objetivo: str | None = "robotica",
     aire_objetivo: str | None = "Aire_1",
 ) -> dict:
-    firebase_db = obtener_firebase()
     supabase = obtener_cliente()
 
     if pabellon_objetivo and aire_objetivo:
@@ -224,6 +223,7 @@ def sincronizar_firebase_supabase(
             }
         }
     else:
+        firebase_db = obtener_firebase()
         datos = firebase_db.child("Atmos").child("registro").get().val()
 
     if not datos:

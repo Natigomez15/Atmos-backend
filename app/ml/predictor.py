@@ -423,6 +423,152 @@ class ServicioPredictor:
     # Características de entrenamiento
     # -----------------------------------------------------------------------
 
+    def obtener_sala(self, sala_id: UUID | str) -> dict | None:
+        cliente = obtener_cliente()
+        respuesta = (
+            cliente.table("rooms")
+            .select("id,nombre,pabellon,edificio")
+            .eq("id", str(sala_id))
+            .limit(1)
+            .execute()
+        )
+        return respuesta.data[0] if respuesta.data else None
+
+    def _consulta_registros_sala(self, sala_id: UUID | str, dias_atras: int) -> list[dict]:
+        cliente = obtener_cliente()
+        desde = (datetime.now(timezone.utc) - timedelta(days=dias_atras)).isoformat()
+
+        respuesta = (
+            cliente.table("registros")
+            .select("*")
+            .eq("sala_id", str(sala_id))
+            .gte("fecha_sync", desde)
+            .order("fecha_sync", desc=False)
+            .execute()
+        )
+        if respuesta.data:
+            return respuesta.data
+
+        sala = self.obtener_sala(sala_id)
+        if not sala:
+            return []
+
+        pabellon = sala.get("pabellon") or sala.get("edificio")
+        aire = sala.get("nombre")
+        if not pabellon or not aire:
+            return []
+
+        respuesta = (
+            cliente.table("registros")
+            .select("*")
+            .eq("pabellon", pabellon)
+            .eq("aire", aire)
+            .gte("fecha_sync", desde)
+            .order("fecha_sync", desc=False)
+            .execute()
+        )
+        return respuesta.data or []
+
+    def obtener_ultimo_registro_sala(self, sala_id: UUID | str) -> dict | None:
+        cliente = obtener_cliente()
+        respuesta = (
+            cliente.table("registros")
+            .select("*")
+            .eq("sala_id", str(sala_id))
+            .order("fecha_sync", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if respuesta.data:
+            return respuesta.data[0]
+
+        sala = self.obtener_sala(sala_id)
+        if not sala:
+            return None
+
+        pabellon = sala.get("pabellon") or sala.get("edificio")
+        aire = sala.get("nombre")
+        if not pabellon or not aire:
+            return None
+
+        respuesta = (
+            cliente.table("registros")
+            .select("*")
+            .eq("pabellon", pabellon)
+            .eq("aire", aire)
+            .order("fecha_sync", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if respuesta.data:
+            return {**respuesta.data[0], "sala_id": str(sala_id)}
+        return None
+
+    def obtener_caracteristicas_desde_registros(
+        self, sala_id: UUID | str, dias_atras: int = 30
+    ) -> list[dict]:
+        registros = self._consulta_registros_sala(sala_id, dias_atras)
+        cubos: dict[datetime, list[dict]] = {}
+
+        for registro in registros:
+            temperatura = registro.get("temperatura_ambiente")
+            humedad = registro.get("humedad")
+            fecha_raw = registro.get("fecha_sync")
+            if temperatura in (None, 0) or humedad in (None, 0) or not fecha_raw:
+                continue
+
+            try:
+                fecha = datetime.fromisoformat(str(fecha_raw).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if fecha.tzinfo is None:
+                fecha = fecha.replace(tzinfo=timezone.utc)
+
+            cubo = fecha.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+            cubos.setdefault(cubo, []).append(registro)
+
+        caracteristicas: list[dict] = []
+        for cubo, filas in sorted(cubos.items()):
+            temperaturas = [
+                float(f["temperatura_ambiente"])
+                for f in filas
+                if f.get("temperatura_ambiente") is not None
+            ]
+            humedades = [
+                float(f["humedad"])
+                for f in filas
+                if f.get("humedad") is not None
+            ]
+            potencias = [float(f.get("potencia_w") or 0) for f in filas]
+            energias = [
+                float(f["energia_kwh"])
+                for f in filas
+                if f.get("energia_kwh") is not None
+            ]
+            presencias = [1 if f.get("estado_ocupacion") is True else 0 for f in filas]
+            fechas = [f.get("fecha_sync") for f in filas if f.get("fecha_sync")]
+            energia_total = (
+                max(energias) - min(energias)
+                if len(energias) >= 2
+                else (energias[-1] if energias else 0.0)
+            )
+
+            caracteristicas.append({
+                "cubo_hora": cubo.isoformat(),
+                "temperatura_promedio": round(sum(temperaturas) / len(temperaturas), 2) if temperaturas else 0.0,
+                "humedad_promedio": round(sum(humedades) / len(humedades), 2) if humedades else 0.0,
+                "razon_presencia": round(sum(presencias) / len(presencias), 4) if presencias else 0.0,
+                "potencia_promedio_w": round(sum(potencias) / len(potencias), 2) if potencias else 0.0,
+                "energia_total_kwh": round(max(0.0, energia_total), 6),
+                "dia_semana": cubo.weekday(),
+                "hora_del_dia": cubo.hour,
+                "cantidad_lecturas": len(filas),
+                "fecha_ultima_lectura": max(fechas) if fechas else None,
+                "fuente": "registros",
+            })
+
+        return caracteristicas
+
     def obtener_caracteristicas_entrenamiento(
         self, sala_id: UUID, dias_atras: int = 30
     ) -> list[dict]:
@@ -451,9 +597,13 @@ class ServicioPredictor:
                 "dia_semana":           fila.get("dia_semana") or 0,
                 "hora_del_dia":         fila.get("hora_del_dia") or 0,
                 "cantidad_lecturas":    fila.get("cantidad_lecturas") or 0,
+                "fuente":               "hourly_aggregates",
             })
 
-        return caracteristicas
+        if caracteristicas:
+            return caracteristicas
+
+        return self.obtener_caracteristicas_desde_registros(sala_id, dias_atras)
 
     # -----------------------------------------------------------------------
     # Guardar predicción

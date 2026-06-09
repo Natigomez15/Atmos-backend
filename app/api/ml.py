@@ -73,6 +73,91 @@ def _mapear_caracteristica(fila: dict) -> dict:
         "weekday": fila.get("dia_semana"),
         "hour_of_day": fila.get("hora_del_dia"),
         "reading_count": fila.get("cantidad_lecturas"),
+        "last_reading_at": fila.get("fecha_ultima_lectura"),
+        "source": fila.get("fuente"),
+    }
+
+
+def _texto_accion(accion: str | None) -> str:
+    acciones = {
+        "apagar": "Apagar aire",
+        "mantener": "Mantener estado actual",
+        "encender_22": "Encender a 22 °C",
+        "ahorro_24": "Modo ahorro a 24 °C",
+        "enfriar_fuerte": "Enfriamiento fuerte",
+    }
+    return acciones.get(str(accion or "").strip().lower(), "Sin recomendación operativa")
+
+
+def _setpoint_accion(accion: str | None) -> int | None:
+    accion_normalizada = str(accion or "").strip().lower()
+    if accion_normalizada in {"encender_22", "enfriar_fuerte"}:
+        return 22
+    if accion_normalizada == "ahorro_24":
+        return 24
+    return None
+
+
+def _fallback_prediccion_desde_registro(sala_id: UUID) -> dict:
+    servicio = ServicioPredictor()
+    registro = servicio.obtener_ultimo_registro_sala(sala_id)
+    if not registro:
+        return {
+            "disponible": False,
+            "motivo": "No hay predicción guardada ni lecturas válidas en registros",
+            "fallback_disponible": False,
+            "fuente": "registros",
+            "room_id": str(sala_id),
+            "sala_id": str(sala_id),
+            "recommended_setpoint": None,
+            "predicted_savings_pct": None,
+            "confidence_score": None,
+            "model_version": "motor_decision_atmos_v1",
+            "operational_recommendation": None,
+            "recommendation_text": "Datos insuficientes",
+            "predicted_at": None,
+        }
+
+    accion = (
+        registro.get("ultima_accion_ejecutada")
+        or registro.get("recomendacion_local")
+        or "mantener"
+    )
+    features = {
+        "temperatura_ambiente": registro.get("temperatura_ambiente"),
+        "humedad": registro.get("humedad"),
+        "estado_ocupacion": registro.get("estado_ocupacion"),
+        "potencia_w": registro.get("potencia_w"),
+        "energia_kwh": registro.get("energia_kwh"),
+        "fecha_sync": registro.get("fecha_sync"),
+        "fuente": "registros",
+    }
+    return {
+        "disponible": False,
+        "motivo": "No hay predicción guardada en ml_predictions",
+        "fallback_disponible": True,
+        "fuente": "registros",
+        "room_id": str(sala_id),
+        "sala_id": str(sala_id),
+        "id": None,
+        "recommended_setpoint": _setpoint_accion(accion),
+        "setpoint_recomendado": _setpoint_accion(accion),
+        "predicted_savings_pct": None,
+        "ahorro_predicho_pct": None,
+        "confidence_score": None,
+        "puntaje_confianza": None,
+        "model_version": "motor_decision_atmos_v1",
+        "version_modelo": "motor_decision_atmos_v1",
+        "snapshot_features": features,
+        "instantanea_caracteristicas": features,
+        "actual_savings_pct": None,
+        "was_applied": False,
+        "fue_aplicado": False,
+        "predicted_at": registro.get("fecha_sync"),
+        "predicho_en": registro.get("fecha_sync"),
+        "operational_recommendation": accion,
+        "recomendacion_actual": accion,
+        "recommendation_text": _texto_accion(accion),
     }
 
 
@@ -170,8 +255,23 @@ async def ultima_prediccion_sala(sala_id: UUID):
 
 @enrutador.get("/predictions/{sala_id}/latest")
 async def latest_prediction_alias(sala_id: UUID):
-    prediccion = await ultima_prediccion_sala(sala_id)
-    return _mapear_prediccion(prediccion)
+    cliente = obtener_cliente()
+    respuesta = (
+        cliente.table("ml_predictions")
+        .select("*")
+        .eq("sala_id", str(sala_id))
+        .order("predicho_en", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if respuesta.data:
+        return {
+            "disponible": True,
+            "fallback_disponible": False,
+            "fuente": "ml_predictions",
+            **_mapear_prediccion(respuesta.data[0]),
+        }
+    return _fallback_prediccion_desde_registro(sala_id)
 
 
 @enrutador.get("/features/{sala_id}")

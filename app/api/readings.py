@@ -207,21 +207,46 @@ async def obtener_registro_reciente(
     aire: str = "Aire_1",
 ):
     cliente = obtener_cliente()
-    consulta = (
+    consulta_base = (
         cliente.table("registros")
         .select("*")
         .order("fecha_sync", desc=True)
         .limit(1)
     )
     if sala_id:
-        consulta = consulta.eq("sala_id", str(sala_id))
-    else:
-        consulta = consulta.eq("pabellon", pabellon).eq("aire", aire)
+        respuesta = consulta_base.eq("sala_id", str(sala_id)).execute()
+        if respuesta.data:
+            return respuesta.data[0]
 
-    respuesta = consulta.execute()
-    if not respuesta.data:
-        raise HTTPException(status_code=404, detail="No hay registros sincronizados")
-    return respuesta.data[0]
+        sala_respuesta = (
+            cliente.table("rooms")
+            .select("nombre,pabellon,edificio")
+            .eq("id", str(sala_id))
+            .limit(1)
+            .execute()
+        )
+        if sala_respuesta.data:
+            sala = sala_respuesta.data[0]
+            pabellon_sala = sala.get("pabellon") or sala.get("edificio")
+            aire_sala = sala.get("nombre")
+            if pabellon_sala and aire_sala:
+                respuesta = (
+                    cliente.table("registros")
+                    .select("*")
+                    .eq("pabellon", pabellon_sala)
+                    .eq("aire", aire_sala)
+                    .order("fecha_sync", desc=True)
+                    .limit(1)
+                    .execute()
+                )
+                if respuesta.data:
+                    return {**respuesta.data[0], "sala_id": str(sala_id)}
+    else:
+        respuesta = consulta_base.eq("pabellon", pabellon).eq("aire", aire).execute()
+        if respuesta.data:
+            return respuesta.data[0]
+
+    raise HTTPException(status_code=404, detail="No hay registros sincronizados")
 
 
 @enrutador.post("/registros", response_model=RegistroRespuesta, status_code=201)

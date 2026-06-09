@@ -14,7 +14,6 @@ HORAS_OPERACION_MES = HORAS_TOTALES_SEMANA * SEMANAS_MES
 ACCIONES_APAGADO = {"apagar", "off", "apagado"}
 ACCIONES_ESPERA = {"esperar_apagado"}
 ACCIONES_ENCENDIDO = {
-    "mantener",
     "encender_22",
     "ahorro_24",
     "enfriar_fuerte",

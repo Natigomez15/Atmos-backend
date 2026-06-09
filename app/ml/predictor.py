@@ -8,6 +8,7 @@ import joblib
 from app.core.database import obtener_cliente
 from app.core.database import obtener_firebase
 from app.ml.atmos_logic import ejecutar_atmos
+from app.ml.impacto import CANTIDAD_AIRES, CONSUMO_AC_KW
 from app.services.sincronizador_firebase import leer_ultima_lectura_valida_firebase_rest
 
 
@@ -356,7 +357,7 @@ class ServicioPredictor:
         cliente = obtener_cliente()
         respuesta = (
             cliente.table("registros")
-            .select("id,firebase_key")
+            .select("id,firebase_key,fecha_sync,energia_kwh,potencia_w,aire_encendido_atmos")
             .eq("pabellon", pabellon)
             .eq("aire", aire)
             .order("fecha_sync", desc=True)
@@ -380,7 +381,41 @@ class ServicioPredictor:
                 or ("fuera_horario_apagar" if not horario["dentro_horario"] else accion)
             ),
         }
-        registro_id = respuesta.data[0]["id"]
+
+        registro_actual = respuesta.data[0]
+        registro_id = registro_actual["id"]
+        accion_normalizada = str(accion or "").strip().lower().replace(" ", "_").replace("-", "_")
+
+        if accion_normalizada == "apagar":
+            aire_encendido = False
+        elif accion_normalizada in {"encender_22", "ahorro_24", "enfriar_fuerte"}:
+            aire_encendido = True
+        elif registro_actual.get("aire_encendido_atmos") is not None:
+            aire_encendido = bool(registro_actual["aire_encendido_atmos"])
+        else:
+            aire_encendido = float(registro_actual.get("potencia_w") or 0) > 0
+
+        potencia_w = CONSUMO_AC_KW * CANTIDAD_AIRES * 1000 if aire_encendido else 0.0
+        energia_anterior = float(registro_actual.get("energia_kwh") or 0)
+        fecha_sync = registro_actual.get("fecha_sync")
+        horas_transcurridas = 0.0
+        if fecha_sync:
+            try:
+                fecha_registro = datetime.fromisoformat(str(fecha_sync).replace("Z", "+00:00"))
+                if fecha_registro.tzinfo is None:
+                    fecha_registro = fecha_registro.replace(tzinfo=timezone.utc)
+                horas_transcurridas = max(
+                    0.0,
+                    (datetime.now(timezone.utc) - fecha_registro.astimezone(timezone.utc)).total_seconds() / 3600,
+                )
+            except ValueError:
+                horas_transcurridas = 0.0
+
+        datos.update({
+            "aire_encendido_atmos": aire_encendido,
+            "potencia_w": round(potencia_w, 2),
+            "energia_kwh": round(energia_anterior + (potencia_w / 1000) * horas_transcurridas, 6),
+        })
         cliente.table("registros").update(datos).eq("id", registro_id).execute()
         return {"actualizado": True, "registro_id": registro_id, **datos}
 

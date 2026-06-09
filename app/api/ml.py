@@ -4,6 +4,7 @@ from uuid import UUID
 from pydantic import BaseModel, Field
 
 from app.ml.predictor import ServicioPredictor
+from app.ml.impacto import resumir_impacto_decisiones, resumir_impacto_real
 from app.core.database import obtener_cliente
 from app.config import configuracion
 from app.core.limiter import limitador
@@ -166,3 +167,27 @@ async def evaluar_predicciones(
             pass
 
     return {"evaluadas": len(todos_resultados), "resultados": todos_resultados}
+
+
+@enrutador.get("/impacto/decisiones")
+async def impacto_decisiones(
+    pabellon: str = "robotica",
+    aire: str = "Aire_1",
+    limite: Annotated[int, Query(ge=1, le=1000)] = 500,
+):
+    cliente = obtener_cliente()
+    respuesta = (
+        cliente.table("registros")
+        .select("ultima_accion_ejecutada,energia_kwh,potencia_w,fecha_sync")
+        .eq("pabellon", pabellon)
+        .eq("aire", aire)
+        .order("fecha_sync", desc=True)
+        .limit(limite)
+        .execute()
+    )
+    return resumir_impacto_decisiones(respuesta.data or [])
+
+
+@enrutador.get("/impacto/real")
+async def impacto_real():
+    return resumir_impacto_real()

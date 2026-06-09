@@ -27,6 +27,11 @@ async def ws_sala(websocket: WebSocket, sala_id: str, api_key: str | None = None
         log.info({"evento": "ws_desconectado", "sala_id": sala_id})
 
 
+@enrutador.websocket("/rooms/{sala_id}")
+async def ws_room_alias(websocket: WebSocket, sala_id: str, api_key: str | None = None):
+    await ws_sala(websocket, sala_id, api_key)
+
+
 @enrutador.websocket("/alertas")
 async def ws_alertas(websocket: WebSocket, api_key: str | None = None):
     sala_id = "alertas"

@@ -46,6 +46,36 @@ class EntradaAtmosFirebase(BaseModel):
     aire: str = "Aire_1"
 
 
+def _mapear_prediccion(prediccion: dict) -> dict:
+    return {
+        **prediccion,
+        "room_id": prediccion.get("sala_id"),
+        "recommended_setpoint": prediccion.get("setpoint_recomendado"),
+        "predicted_savings_pct": prediccion.get("ahorro_predicho_pct"),
+        "confidence_score": prediccion.get("puntaje_confianza"),
+        "model_version": prediccion.get("version_modelo"),
+        "snapshot_features": prediccion.get("instantanea_caracteristicas"),
+        "actual_savings_pct": prediccion.get("ahorro_real_pct"),
+        "was_applied": prediccion.get("fue_aplicado"),
+        "predicted_at": prediccion.get("predicho_en"),
+    }
+
+
+def _mapear_caracteristica(fila: dict) -> dict:
+    return {
+        **fila,
+        "bucket_hour": fila.get("cubo_hora"),
+        "avg_temp": fila.get("temperatura_promedio"),
+        "avg_humidity": fila.get("humedad_promedio"),
+        "presence_ratio": fila.get("razon_presencia"),
+        "avg_power_w": fila.get("potencia_promedio_w"),
+        "total_energy_kwh": fila.get("energia_total_kwh"),
+        "weekday": fila.get("dia_semana"),
+        "hour_of_day": fila.get("hora_del_dia"),
+        "reading_count": fila.get("cantidad_lecturas"),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -138,6 +168,23 @@ async def ultima_prediccion_sala(sala_id: UUID):
     return respuesta.data[0]
 
 
+@enrutador.get("/predictions/{sala_id}/latest")
+async def latest_prediction_alias(sala_id: UUID):
+    prediccion = await ultima_prediccion_sala(sala_id)
+    return _mapear_prediccion(prediccion)
+
+
+@enrutador.get("/features/{sala_id}")
+async def features_alias(
+    sala_id: UUID,
+    days_back: Annotated[int, Query(ge=1, le=90)] = 30,
+):
+    caracteristicas = ServicioPredictor().obtener_caracteristicas_entrenamiento(
+        sala_id, days_back
+    )
+    return [_mapear_caracteristica(fila) for fila in caracteristicas]
+
+
 @enrutador.post("/evaluar")
 async def evaluar_predicciones(
     sala_id: Optional[UUID] = None,
@@ -167,6 +214,14 @@ async def evaluar_predicciones(
             pass
 
     return {"evaluadas": len(todos_resultados), "resultados": todos_resultados}
+
+
+@enrutador.post("/evaluate")
+async def evaluate_alias(
+    sala_id: Optional[UUID] = None,
+    x_cron_secret: Annotated[Optional[str], Header()] = None,
+):
+    return await evaluar_predicciones(sala_id=sala_id, x_cron_secret=x_cron_secret)
 
 
 @enrutador.get("/impacto/decisiones")

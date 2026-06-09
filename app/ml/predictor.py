@@ -47,6 +47,11 @@ class ServicioPredictor:
         firebase_db = obtener_firebase()
         lectura = self.obtener_ultima_lectura_firebase(firebase_db, area, aire)
         datos_atmos = self.preparar_lectura_firebase(lectura)
+        if datos_atmos.get("presencia") == 0:
+            datos_atmos["minutos_sin_presencia"] = self.calcular_minutos_sin_presencia(
+                pabellon=area,
+                aire=aire,
+            ) or 0
         horario = self.obtener_estado_horario_operacion()
 
         if horario["dentro_horario"]:
@@ -63,6 +68,13 @@ class ServicioPredictor:
         firebase_db.child("Atmos").child("comandos").child(area).child(aire).update({
             "accion": accion,
         })
+        actualizacion_supabase = self.guardar_decision_en_registro(
+            pabellon=area,
+            aire=aire,
+            accion=accion,
+            resultado=resultado,
+            horario=horario,
+        )
 
         return {
             "lectura_firebase": lectura,
@@ -71,6 +83,7 @@ class ServicioPredictor:
             "accion": accion,
             "horario": horario,
             "ruta_accion": f"/Atmos/comandos/{area}/{aire}/accion",
+            "actualizacion_supabase": actualizacion_supabase,
         }
 
     def obtener_estado_horario_operacion(self, ahora: datetime | None = None) -> dict:
@@ -214,9 +227,47 @@ class ServicioPredictor:
         return "mantener"
 
     def calcular_minutos_sin_presencia(
-        self, sala_id: UUID | str | None = None, nodo_id: UUID | str | None = None
+        self,
+        sala_id: UUID | str | None = None,
+        nodo_id: UUID | str | None = None,
+        pabellon: str | None = None,
+        aire: str | None = None,
     ) -> int | None:
         cliente = obtener_cliente()
+
+        # La fuente principal actual del prototipo es registros, sincronizada
+        # desde Firebase. sensor_readings se mantiene como fallback legado.
+        consulta_registros = (
+            cliente.table("registros")
+            .select("fecha_sync")
+            .eq("estado_ocupacion", True)
+            .order("fecha_sync", desc=True)
+            .limit(1)
+        )
+        if sala_id:
+            consulta_registros = consulta_registros.eq("sala_id", str(sala_id))
+        if nodo_id:
+            consulta_registros = consulta_registros.eq("nodo_id", str(nodo_id))
+        if pabellon:
+            consulta_registros = consulta_registros.eq("pabellon", pabellon)
+        if aire:
+            consulta_registros = consulta_registros.eq("aire", aire)
+
+        try:
+            respuesta_registros = consulta_registros.execute()
+            if respuesta_registros.data:
+                ultimo_registro = respuesta_registros.data[0].get("fecha_sync")
+                if ultimo_registro:
+                    ultima_presencia = datetime.fromisoformat(
+                        ultimo_registro.replace("Z", "+00:00")
+                    )
+                    if ultima_presencia.tzinfo is None:
+                        ultima_presencia = ultima_presencia.replace(tzinfo=timezone.utc)
+                    diferencia = datetime.now(timezone.utc) - ultima_presencia
+                    return max(0, int(diferencia.total_seconds() // 60))
+        except Exception:
+            pass
+
         consulta = (
             cliente.table("sensor_readings")
             .select("registrado_en")
@@ -246,6 +297,45 @@ class ServicioPredictor:
 
         diferencia = datetime.now(timezone.utc) - ultima_presencia
         return max(0, int(diferencia.total_seconds() // 60))
+
+    def guardar_decision_en_registro(
+        self,
+        pabellon: str,
+        aire: str,
+        accion: str,
+        resultado: dict | None,
+        horario: dict,
+    ) -> dict:
+        cliente = obtener_cliente()
+        respuesta = (
+            cliente.table("registros")
+            .select("id,firebase_key")
+            .eq("pabellon", pabellon)
+            .eq("aire", aire)
+            .order("fecha_sync", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if not respuesta.data:
+            return {"actualizado": False, "motivo": "sin_registros"}
+
+        decision_ml = None
+        decision_final = None
+        if resultado:
+            decision_ml = (resultado.get("modelo") or {}).get("decision_ml")
+            decision_final = (resultado.get("control") or {}).get("decision_final")
+
+        datos = {
+            "ultima_accion_ejecutada": accion,
+            "recomendacion_local": (
+                decision_final
+                or decision_ml
+                or ("fuera_horario_apagar" if not horario["dentro_horario"] else accion)
+            ),
+        }
+        registro_id = respuesta.data[0]["id"]
+        cliente.table("registros").update(datos).eq("id", registro_id).execute()
+        return {"actualizado": True, "registro_id": registro_id, **datos}
 
     # -----------------------------------------------------------------------
     # Características de entrenamiento

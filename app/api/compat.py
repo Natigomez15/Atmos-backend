@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from app.core.database import obtener_cliente
 from app.ml.impacto import TARIFA_KWH
 from app.models.schemas import SalaActualizar, SalaCrear
+from app.api.ac_commands import comando_desde_prediccion
 
 
 enrutador = APIRouter(tags=["compatibilidad"])
@@ -43,6 +44,32 @@ def _mapear_sala(sala: dict) -> dict:
         "pavilion": sala.get("pabellon") or sala.get("edificio"),
         "floor": sala.get("piso"),
         "capacity": sala.get("capacidad"),
+    }
+
+
+def _mapear_comando(comando: dict) -> dict:
+    return {
+        **comando,
+        "command_id": comando.get("id"),
+        "comando_id": comando.get("id"),
+        "room_id": comando.get("sala_id"),
+        "command_type": comando.get("tipo_comando"),
+        "mode": comando.get("modo"),
+        "source": comando.get("origen"),
+        "was_executed": comando.get("fue_ejecutado"),
+        "commanded_at": comando.get("enviado_en"),
+        "executed_at": comando.get("ejecutado_en"),
+    }
+
+
+def _normalizar_payload_comando(payload: dict) -> dict:
+    return {
+        "sala_id": payload.get("sala_id") or payload.get("room_id"),
+        "nodo_id": payload.get("nodo_id") or payload.get("node_id"),
+        "tipo_comando": payload.get("tipo_comando") or payload.get("command_type"),
+        "setpoint": payload.get("setpoint"),
+        "modo": payload.get("modo") or payload.get("mode"),
+        "origen": payload.get("origen") or payload.get("source") or "manual",
     }
 
 
@@ -233,3 +260,145 @@ async def resumen_pabellon(period_days: int = 1):
         "avg_savings_pct": 0,
         "rooms_count": 0,
     }
+
+
+@enrutador.get("/ac-commands")
+async def listar_ac_commands(
+    room_id: Optional[UUID] = None,
+    sala_id: Optional[UUID] = None,
+    only_pending: Optional[bool] = None,
+    solo_pendientes: Optional[bool] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+):
+    id_sala = sala_id or room_id
+    if not id_sala:
+        return []
+
+    cliente = obtener_cliente()
+    consulta = (
+        cliente.table("ac_commands")
+        .select("*")
+        .eq("sala_id", str(id_sala))
+        .order("enviado_en", desc=True)
+        .limit(limit)
+    )
+    if only_pending is True or solo_pendientes is True:
+        consulta = consulta.eq("fue_ejecutado", False)
+
+    respuesta = consulta.execute()
+    return [_mapear_comando(comando) for comando in respuesta.data or []]
+
+
+@enrutador.post("/ac-commands", status_code=201)
+async def crear_ac_command(request: Request):
+    payload = _normalizar_payload_comando(await request.json())
+    if not payload.get("sala_id") or not payload.get("tipo_comando"):
+        raise HTTPException(status_code=422, detail="Faltan room_id o command_type")
+    if payload["tipo_comando"] == "setpoint" and payload.get("setpoint") is None:
+        raise HTTPException(status_code=422, detail="setpoint es obligatorio")
+
+    datos = {
+        **payload,
+        "fue_ejecutado": False,
+        "ejecutado_en": None,
+    }
+    cliente = obtener_cliente()
+    respuesta = cliente.table("ac_commands").insert(datos).execute()
+    if not respuesta.data:
+        raise HTTPException(status_code=400, detail="Error al crear comando")
+    return _mapear_comando(respuesta.data[0])
+
+
+@enrutador.post("/ac-commands/from-prediction/{prediccion_id}", status_code=201)
+async def ac_command_from_prediction(prediccion_id: int):
+    comando = await comando_desde_prediccion(prediccion_id)
+    return _mapear_comando(comando)
+
+
+@enrutador.post("/reports/energy")
+async def reporte_energia(carga: dict | None = None):
+    cliente = obtener_cliente()
+    respuesta = (
+        cliente.table("registros")
+        .select("*")
+        .order("fecha_sync", desc=True)
+        .limit(1000)
+        .execute()
+    )
+    registros = respuesta.data or []
+    por_salon: dict[tuple[str, str], list[dict]] = {}
+    for registro in registros:
+        clave = (registro.get("pabellon") or "", registro.get("aire") or "")
+        por_salon.setdefault(clave, []).append(registro)
+
+    rooms = []
+    for (pabellon, aire), filas in por_salon.items():
+        energias = [f["energia_kwh"] for f in filas if f.get("energia_kwh") is not None]
+        potencias = [f["potencia_w"] for f in filas if f.get("potencia_w") is not None]
+        energia = (
+            max(energias) - min(energias)
+            if len(energias) >= 2
+            else (sum(potencias) / len(potencias) / 1000 if potencias else 0)
+        )
+        rooms.append({
+            "room_name": aire,
+            "pavilion": pabellon,
+            "total_energy_kwh": energia,
+            "total_cost": energia * TARIFA_KWH,
+            "savings_pct": None,
+            "savings_cost": 0,
+            "recommendations": [],
+        })
+
+    return {"type": "energy", "rooms": rooms, "generated_at": datetime.now(timezone.utc).isoformat()}
+
+
+@enrutador.post("/reports/room/{sala_id}")
+async def reporte_room(sala_id: UUID, carga: dict | None = None):
+    room = await obtener_room(sala_id)
+    pabellon = room.get("pabellon") or room.get("pavilion") or room.get("edificio")
+    aire = room.get("nombre") or room.get("name")
+    cliente = obtener_cliente()
+    respuesta = (
+        cliente.table("registros")
+        .select("*")
+        .eq("pabellon", pabellon)
+        .eq("aire", aire)
+        .order("fecha_sync", desc=True)
+        .limit(500)
+        .execute()
+    )
+    return {"room": room, "readings": respuesta.data or []}
+
+
+@enrutador.get("/reports/compare")
+async def comparar_room(room_id: UUID, period_days: int = 30):
+    room = await obtener_room(room_id)
+    pabellon = room.get("pabellon") or room.get("pavilion") or room.get("edificio")
+    aire = room.get("nombre") or room.get("name")
+    cliente = obtener_cliente()
+    respuesta = (
+        cliente.table("registros")
+        .select("energia_kwh,potencia_w,fecha_sync")
+        .eq("pabellon", pabellon)
+        .eq("aire", aire)
+        .order("fecha_sync", desc=True)
+        .limit(500)
+        .execute()
+    )
+    filas = respuesta.data or []
+    energias = [f["energia_kwh"] for f in filas if f.get("energia_kwh") is not None]
+    energia = max(energias) - min(energias) if len(energias) >= 2 else 0
+    return {
+        "room_id": str(room_id),
+        "total_energy_kwh": energia,
+        "baseline_energy_kwh": energia,
+        "energy_change_pct": 0,
+        "cost_change_usd": 0,
+        "period_days": period_days,
+    }
+
+
+@enrutador.get("/reports/history")
+async def historial_reports(limit: Annotated[int, Query(ge=1, le=100)] = 10):
+    return []

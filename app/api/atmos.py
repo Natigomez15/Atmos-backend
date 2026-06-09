@@ -4,7 +4,10 @@ from fastapi import APIRouter, Header, HTTPException
 
 from app.config import configuracion
 from app.ml.predictor import ServicioPredictor
-from app.services.sincronizador_firebase import sincronizar_firebase_supabase
+from app.services.sincronizador_firebase import (
+    leer_ultima_lectura_valida_firebase_rest,
+    sincronizar_firebase_supabase,
+)
 
 
 enrutador = APIRouter(prefix="/atmos", tags=["atmos"])
@@ -37,9 +40,35 @@ def procesar_lectura_atmos(
         return {
             "sincronizacion": sincronizacion,
             "decision": decision,
+            "diagnostico": decision.get("diagnostico") or sincronizacion.get("diagnostico"),
             "flujo": "firebase_supabase_ml_firebase",
         }
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error))
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"Error procesando ATMOS: {error}")
+
+
+@enrutador.get("/diagnostico")
+def diagnostico_lecturas_atmos(
+    pabellon: str = "robotica",
+    aire: str = "Aire_1",
+):
+    try:
+        seleccion = leer_ultima_lectura_valida_firebase_rest(
+            pabellon=pabellon,
+            aire=aire,
+            limite=50,
+        )
+        return {
+            "pabellon": pabellon,
+            "aire": aire,
+            "lectura_valida": seleccion["valida"],
+            "firebase_key_usado": seleccion["firebase_key"],
+            "lectura_usada": seleccion["lectura"],
+            "lecturas_invalidas_ignoradas": seleccion["lecturas_invalidas_ignoradas"],
+            "advertencias": seleccion["advertencias"],
+            "diagnostico": seleccion["diagnostico"],
+        }
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"Error diagnosticando ATMOS: {error}")

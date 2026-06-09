@@ -65,6 +65,7 @@ class ServicioPredictor:
                 "lectura_valida": False,
                 "firebase_key_usado": None,
                 "lecturas_invalidas_ignoradas": seleccion["lecturas_invalidas_ignoradas"],
+                "diagnostico": seleccion.get("diagnostico"),
                 "advertencias": seleccion["advertencias"],
                 "entrada_modelo": None,
                 "resultado_modelo": None,
@@ -115,6 +116,7 @@ class ServicioPredictor:
                 else None
             ),
             "lecturas_invalidas_ignoradas": seleccion["lecturas_invalidas_ignoradas"],
+            "diagnostico": seleccion.get("diagnostico"),
             "advertencias": seleccion["advertencias"],
             "entrada_modelo": datos_atmos,
             "resultado_modelo": resultado,

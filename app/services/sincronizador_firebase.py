@@ -107,6 +107,88 @@ def validar_lectura_firebase(valor: dict) -> tuple[bool, list[str]]:
     return len(razones) == 0, razones
 
 
+def construir_diagnostico_lecturas(lecturas: dict, seleccion: dict) -> dict:
+    items = list(sorted(lecturas.items())) if isinstance(lecturas, dict) else []
+    total = len(items)
+    validas = 0
+    invalidas = 0
+    razones_invalidas: dict[str, int] = {}
+    ultimas_invalidas_consecutivas = 0
+    ceros_repetidos = 0
+    ultima_key = items[-1][0] if items else None
+    ultima_valida = None
+
+    for firebase_key, valor in items:
+        if not isinstance(valor, dict):
+            invalidas += 1
+            razones = ["formato invalido"]
+        else:
+            es_valida, razones = validar_lectura_firebase(valor)
+            if es_valida:
+                validas += 1
+                ultima_valida = firebase_key
+                continue
+            invalidas += 1
+            temperatura = _leer_numero_opcional(
+                obtener_valor_lectura(
+                    valor,
+                    "temperatura_ambiente",
+                    "temperatura",
+                    "temperatura_dht11",
+                    "temp_ambiente",
+                )
+            )
+            humedad = _leer_numero_opcional(valor.get("humedad"))
+            if temperatura == 0 and humedad == 0:
+                ceros_repetidos += 1
+
+        for razon in razones:
+            razones_invalidas[razon] = razones_invalidas.get(razon, 0) + 1
+
+    for _firebase_key, valor in reversed(items[-5:]):
+        if not isinstance(valor, dict):
+            ultimas_invalidas_consecutivas += 1
+            continue
+        es_valida, _razones = validar_lectura_firebase(valor)
+        if es_valida:
+            break
+        ultimas_invalidas_consecutivas += 1
+
+    porcentaje_invalidas = round((invalidas / total) * 100, 2) if total else 0
+    ultima_lectura_recibida_valida = False
+    if items and isinstance(items[-1][1], dict):
+        ultima_lectura_recibida_valida = validar_lectura_firebase(items[-1][1])[0]
+
+    posible_fallo_sensor = (
+        (total > 0 and porcentaje_invalidas > 50)
+        or ultimas_invalidas_consecutivas >= 5
+        or ceros_repetidos >= 3
+        or validas == 0
+    )
+    mensaje = (
+        "Se detectaron muchas lecturas invalidas recientes con temperatura/humedad en 0"
+        if posible_fallo_sensor
+        else "Sensor estable segun las lecturas recientes"
+    )
+
+    return {
+        "lecturas_revisadas": total,
+        "lecturas_validas": validas,
+        "lecturas_invalidas": invalidas,
+        "porcentaje_invalidas": porcentaje_invalidas,
+        "ultima_lectura_recibida_key": ultima_key,
+        "ultima_lectura_recibida_valida": ultima_lectura_recibida_valida,
+        "ultima_lectura_valida_key": seleccion.get("firebase_key") or ultima_valida,
+        "firebase_key_usado": seleccion.get("firebase_key"),
+        "razones_invalidas": razones_invalidas,
+        "ultimas_invalidas_consecutivas": ultimas_invalidas_consecutivas,
+        "lecturas_cero_repetidas": ceros_repetidos,
+        "posible_fallo_sensor": posible_fallo_sensor,
+        "estado_sensor": "Sensor con posibles fallos" if posible_fallo_sensor else "Sensor estable",
+        "mensaje": mensaje,
+    }
+
+
 def seleccionar_ultima_lectura_valida(lecturas: dict) -> dict:
     if not isinstance(lecturas, dict) or not lecturas:
         return {
@@ -115,6 +197,7 @@ def seleccionar_ultima_lectura_valida(lecturas: dict) -> dict:
             "lectura": None,
             "lecturas_invalidas_ignoradas": 0,
             "advertencias": ["No hay lecturas en Firebase"],
+            "diagnostico": construir_diagnostico_lecturas({}, {"firebase_key": None}),
         }
 
     lecturas_invalidas = 0
@@ -128,24 +211,30 @@ def seleccionar_ultima_lectura_valida(lecturas: dict) -> dict:
 
         es_valida, razones = validar_lectura_firebase(valor)
         if es_valida:
-            return {
+            seleccion = {
                 "valida": True,
                 "firebase_key": firebase_key,
                 "lectura": valor,
                 "lecturas_invalidas_ignoradas": lecturas_invalidas,
                 "advertencias": advertencias[:10],
             }
+            seleccion["diagnostico"] = construir_diagnostico_lecturas(
+                lecturas, seleccion
+            )
+            return seleccion
 
         lecturas_invalidas += 1
         advertencias.append(f"{firebase_key}: {', '.join(razones)}")
 
-    return {
+    seleccion = {
         "valida": False,
         "firebase_key": None,
         "lectura": None,
         "lecturas_invalidas_ignoradas": lecturas_invalidas,
         "advertencias": advertencias[:10],
     }
+    seleccion["diagnostico"] = construir_diagnostico_lecturas(lecturas, seleccion)
+    return seleccion
 
 
 def resolver_sala_id(supabase, pabellon: str, aire: str, valor: dict) -> str | None:
@@ -408,6 +497,7 @@ def sincronizar_firebase_supabase(
                 "lectura_valida": False,
                 "lecturas_invalidas_ignoradas": seleccion["lecturas_invalidas_ignoradas"],
                 "firebase_key_usado": None,
+                "diagnostico": seleccion["diagnostico"],
                 "advertencias": seleccion["advertencias"],
                 "mensaje": "No hay lectura valida suficiente en Firebase.",
                 "etapas": etapas,
@@ -498,6 +588,7 @@ def sincronizar_firebase_supabase(
             else None
         ),
         "advertencias": metadata_seleccion["advertencias"] if metadata_seleccion else [],
+        "diagnostico": metadata_seleccion["diagnostico"] if metadata_seleccion else None,
         "etapas": etapas,
         "duracion_total_ms": round((time.monotonic() - inicio_total) * 1000, 2),
     }

@@ -13,6 +13,8 @@ from app.services.sincronizador_firebase import leer_ultima_lectura_valida_fireb
 
 
 MODELO_ATMOS_PATH = Path(__file__).with_name("modelo_atmos (1).pkl")
+VERSION_MODELO_ATMOS = "modelo_atmos_rf_v1"
+FEATURES_MODELO_ATMOS = ["presencia", "temp_ambiente", "temp_ac", "delta_t", "humedad"]
 ZONA_HORARIA_ATMOS = timezone(timedelta(hours=-5), "America/Panama")
 HORA_INICIO_OPERACION = time(7, 0)
 HORA_FIN_OPERACION = time(22, 45)
@@ -41,7 +43,9 @@ class ServicioPredictor:
                 datos["minutos_sin_presencia"] = minutos
 
         modelo = cargar_modelo_atmos()
-        return ejecutar_atmos(modelo, **datos)
+        resultado = ejecutar_atmos(modelo, **datos)
+        resultado["modelo_ml"] = self.construir_trazabilidad_modelo(resultado, datos)
+        return resultado
 
     def decidir_atmos_desde_firebase(
         self, area: str = "robotica", aire: str = "Aire_1"
@@ -70,6 +74,9 @@ class ServicioPredictor:
                 "advertencias": seleccion["advertencias"],
                 "entrada_modelo": None,
                 "resultado_modelo": None,
+                "modelo_ml": self.trazabilidad_modelo_no_usado(
+                    "no hay lectura valida suficiente para ejecutar el modelo"
+                ),
                 "accion": accion,
                 "horario": horario,
                 "ruta_accion": f"/Atmos/comandos/{area}/{aire}/accion",
@@ -107,6 +114,21 @@ class ServicioPredictor:
             resultado=resultado,
             horario=horario,
         )
+        modelo_ml = (
+            resultado.get("modelo_ml")
+            if resultado
+            else self.trazabilidad_modelo_no_usado(
+                "fuera de horario permitido; se fuerza accion apagar"
+            )
+        )
+        prediccion_guardada = self.guardar_prediccion_modelo_valida(
+            pabellon=area,
+            aire=aire,
+            accion=accion,
+            resultado=resultado,
+            modelo_ml=modelo_ml,
+            actualizacion_supabase=actualizacion_supabase,
+        )
 
         return {
             "lectura_firebase": lectura,
@@ -121,10 +143,82 @@ class ServicioPredictor:
             "advertencias": seleccion["advertencias"],
             "entrada_modelo": datos_atmos,
             "resultado_modelo": resultado,
+            "modelo_ml": modelo_ml,
             "accion": accion,
             "horario": horario,
             "ruta_accion": f"/Atmos/comandos/{area}/{aire}/accion",
             "actualizacion_supabase": actualizacion_supabase,
+            "prediccion_guardada": prediccion_guardada,
+        }
+
+    def informacion_modelo(self) -> dict:
+        try:
+            modelo = cargar_modelo_atmos()
+            tipo_modelo = type(modelo).__name__
+            features = list(getattr(modelo, "feature_names_in_", FEATURES_MODELO_ATMOS))
+        except Exception:
+            tipo_modelo = None
+            features = FEATURES_MODELO_ATMOS
+
+        return {
+            "modelo_disponible": MODELO_ATMOS_PATH.exists(),
+            "tipo_modelo": tipo_modelo,
+            "version_modelo": VERSION_MODELO_ATMOS,
+            "features_requeridas": features,
+        }
+
+    def trazabilidad_modelo_no_usado(
+        self,
+        motivo: str,
+        features_usadas: dict | None = None,
+    ) -> dict:
+        return {
+            **self.informacion_modelo(),
+            "modelo_usado": False,
+            "motivo_no_usado": motivo,
+            "features_usadas": features_usadas,
+            "prediccion_modelo": None,
+            "probabilidades": None,
+        }
+
+    def construir_trazabilidad_modelo(self, resultado: dict, datos_atmos: dict) -> dict:
+        features = self.construir_features_modelo(datos_atmos)
+        if not resultado.get("valido"):
+            errores = resultado.get("errores") or ["lectura invalida"]
+            return self.trazabilidad_modelo_no_usado(
+                "; ".join(errores),
+                features_usadas=features,
+            )
+
+        probabilidades_pct = (resultado.get("modelo") or {}).get("probabilidades") or {}
+        probabilidades = {
+            clase: round(float(probabilidad) / 100, 4)
+            for clase, probabilidad in probabilidades_pct.items()
+        }
+
+        return {
+            **self.informacion_modelo(),
+            "modelo_usado": True,
+            "motivo_no_usado": None,
+            "features_usadas": features,
+            "prediccion_modelo": (resultado.get("modelo") or {}).get("decision_ml"),
+            "probabilidades": probabilidades,
+        }
+
+    def construir_features_modelo(self, datos_atmos: dict) -> dict:
+        temp_ambiente = datos_atmos.get("temp_ambiente")
+        temp_ac = datos_atmos.get("temp_ac")
+        try:
+            delta_t = float(temp_ambiente) - float(temp_ac)
+        except (TypeError, ValueError):
+            delta_t = datos_atmos.get("delta_t")
+
+        return {
+            "presencia": datos_atmos.get("presencia"),
+            "temp_ambiente": temp_ambiente,
+            "temp_ac": temp_ac,
+            "delta_t": round(delta_t, 2) if isinstance(delta_t, (int, float)) else delta_t,
+            "humedad": datos_atmos.get("humedad"),
         }
 
     def obtener_estado_horario_operacion(self, ahora: datetime | None = None) -> dict:
@@ -228,10 +322,18 @@ class ServicioPredictor:
             requerido=False,
             defecto=None,
         )
-        if temp_ac_raw is None:
-            delta_t = float(buscar("delta_t"))
-            temp_ac = temp_ambiente - delta_t
-        else:
+        delta_t_raw = buscar("delta_t", requerido=False, defecto=None)
+        temp_ac = None
+        if temp_ac_raw is not None:
+            temp_ac = float(temp_ac_raw)
+
+        if (temp_ac is None or temp_ac < 5 or temp_ac > 35) and delta_t_raw is not None:
+            delta_t = float(delta_t_raw)
+            temp_ac_desde_delta = temp_ambiente - delta_t
+            if 5 <= temp_ac_desde_delta <= 35:
+                temp_ac = temp_ac_desde_delta
+
+        if temp_ac is None:
             temp_ac = float(temp_ac_raw)
 
         return {
@@ -357,7 +459,7 @@ class ServicioPredictor:
         cliente = obtener_cliente()
         respuesta = (
             cliente.table("registros")
-            .select("id,firebase_key,fecha_sync,energia_kwh,potencia_w,aire_encendido_atmos")
+            .select("id,firebase_key,sala_id,fecha_sync,energia_kwh,potencia_w,aire_encendido_atmos")
             .eq("pabellon", pabellon)
             .eq("aire", aire)
             .order("fecha_sync", desc=True)
@@ -417,7 +519,87 @@ class ServicioPredictor:
             "energia_kwh": round(energia_anterior + (potencia_w / 1000) * horas_transcurridas, 6),
         })
         cliente.table("registros").update(datos).eq("id", registro_id).execute()
-        return {"actualizado": True, "registro_id": registro_id, **datos}
+        return {
+            "actualizado": True,
+            "registro_id": registro_id,
+            "sala_id": registro_actual.get("sala_id"),
+            **datos,
+        }
+
+    def resolver_sala_id_por_pabellon_aire(self, pabellon: str, aire: str) -> str | None:
+        cliente = obtener_cliente()
+        respuesta = (
+            cliente.table("rooms")
+            .select("id,nombre,pabellon,edificio")
+            .or_(f"pabellon.eq.{pabellon},edificio.eq.{pabellon}")
+            .execute()
+        )
+        salas = respuesta.data or []
+        for sala in salas:
+            if str(sala.get("nombre") or "").strip().lower() == aire.strip().lower():
+                return sala.get("id")
+        if len(salas) == 1:
+            return salas[0].get("id")
+        return None
+
+    def setpoint_desde_accion(self, accion: str | None) -> int | None:
+        accion_normalizada = str(accion or "").strip().lower()
+        if accion_normalizada in {"encender_22", "enfriar_fuerte"}:
+            return 22
+        if accion_normalizada == "ahorro_24":
+            return 24
+        return None
+
+    def guardar_prediccion_modelo_valida(
+        self,
+        pabellon: str,
+        aire: str,
+        accion: str,
+        resultado: dict | None,
+        modelo_ml: dict | None,
+        actualizacion_supabase: dict,
+    ) -> dict:
+        if not modelo_ml or not modelo_ml.get("modelo_usado"):
+            return {
+                "guardada": False,
+                "motivo": (modelo_ml or {}).get("motivo_no_usado") or "modelo no usado",
+            }
+
+        sala_id = actualizacion_supabase.get("sala_id") or self.resolver_sala_id_por_pabellon_aire(
+            pabellon, aire
+        )
+        if not sala_id:
+            return {"guardada": False, "motivo": "no se pudo resolver sala_id"}
+
+        probabilidades = modelo_ml.get("probabilidades") or {}
+        confianza = max(probabilidades.values()) if probabilidades else None
+        instantanea = {
+            "features_usadas": modelo_ml.get("features_usadas"),
+            "prediccion_modelo": modelo_ml.get("prediccion_modelo"),
+            "probabilidades": probabilidades,
+            "accion_final": accion,
+            "fuente": "modelo_pkl",
+            "motivo_reglas_seguridad": (
+                (resultado or {}).get("seguridad") or {}
+            ).get("mensaje"),
+        }
+        registro = {
+            "sala_id": str(sala_id),
+            "setpoint_recomendado": self.setpoint_desde_accion(accion),
+            "ahorro_predicho_pct": None,
+            "puntaje_confianza": confianza,
+            "version_modelo": VERSION_MODELO_ATMOS,
+            "instantanea_caracteristicas": instantanea,
+            "ahorro_real_pct": None,
+            "fue_aplicado": actualizacion_supabase.get("actualizado") is True,
+            "predicho_en": datetime.now(timezone.utc).isoformat(),
+        }
+        respuesta = obtener_cliente().table("ml_predictions").insert(registro).execute()
+        return {
+            "guardada": True,
+            "id": respuesta.data[0].get("id") if respuesta.data else None,
+            "sala_id": str(sala_id),
+        }
 
     # -----------------------------------------------------------------------
     # Características de entrenamiento

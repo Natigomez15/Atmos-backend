@@ -40,6 +40,7 @@ def procesar_lectura_atmos(
         return {
             "sincronizacion": sincronizacion,
             "decision": decision,
+            "modelo_ml": decision.get("modelo_ml"),
             "diagnostico": decision.get("diagnostico") or sincronizacion.get("diagnostico"),
             "flujo": "firebase_supabase_ml_firebase",
         }

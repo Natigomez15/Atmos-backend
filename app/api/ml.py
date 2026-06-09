@@ -47,6 +47,18 @@ class EntradaAtmosFirebase(BaseModel):
 
 
 def _mapear_prediccion(prediccion: dict) -> dict:
+    instantanea = prediccion.get("instantanea_caracteristicas") or {}
+    modelo_ml = {
+        "modelo_disponible": True,
+        "modelo_usado": instantanea.get("fuente") == "modelo_pkl",
+        "tipo_modelo": "RandomForestClassifier",
+        "version_modelo": prediccion.get("version_modelo"),
+        "features_usadas": instantanea.get("features_usadas"),
+        "prediccion_modelo": instantanea.get("prediccion_modelo"),
+        "probabilidades": instantanea.get("probabilidades"),
+        "accion_final": instantanea.get("accion_final"),
+        "motivo_reglas_seguridad": instantanea.get("motivo_reglas_seguridad"),
+    }
     return {
         **prediccion,
         "room_id": prediccion.get("sala_id"),
@@ -58,6 +70,7 @@ def _mapear_prediccion(prediccion: dict) -> dict:
         "actual_savings_pct": prediccion.get("ahorro_real_pct"),
         "was_applied": prediccion.get("fue_aplicado"),
         "predicted_at": prediccion.get("predicho_en"),
+        "modelo_ml": modelo_ml,
     }
 
 
@@ -100,6 +113,7 @@ def _setpoint_accion(accion: str | None) -> int | None:
 
 def _fallback_prediccion_desde_registro(sala_id: UUID) -> dict:
     servicio = ServicioPredictor()
+    info_modelo = servicio.informacion_modelo()
     registro = servicio.obtener_ultimo_registro_sala(sala_id)
     if not registro:
         return {
@@ -113,6 +127,14 @@ def _fallback_prediccion_desde_registro(sala_id: UUID) -> dict:
             "predicted_savings_pct": None,
             "confidence_score": None,
             "model_version": "motor_decision_atmos_v1",
+            "modelo_ml": {
+                **info_modelo,
+                "modelo_usado": False,
+                "motivo_no_usado": "no hay lecturas validas suficientes en registros",
+                "features_usadas": None,
+                "prediccion_modelo": None,
+                "probabilidades": None,
+            },
             "operational_recommendation": None,
             "recommendation_text": "Datos insuficientes",
             "predicted_at": None,
@@ -148,6 +170,14 @@ def _fallback_prediccion_desde_registro(sala_id: UUID) -> dict:
         "puntaje_confianza": None,
         "model_version": "motor_decision_atmos_v1",
         "version_modelo": "motor_decision_atmos_v1",
+        "modelo_ml": {
+            **info_modelo,
+            "modelo_usado": False,
+            "motivo_no_usado": "no hay prediccion guardada en ml_predictions; se muestra fallback operativo desde registros",
+            "features_usadas": None,
+            "prediccion_modelo": None,
+            "probabilidades": None,
+        },
         "snapshot_features": features,
         "instantanea_caracteristicas": features,
         "actual_savings_pct": None,

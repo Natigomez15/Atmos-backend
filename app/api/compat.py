@@ -5,6 +5,7 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from app.core.database import obtener_cliente
+from app.ml.impacto import TARIFA_KWH
 from app.models.schemas import SalaActualizar, SalaCrear
 
 
@@ -223,9 +224,11 @@ async def resumen_pabellon(period_days: int = 1):
         if len(energias) >= 2
         else (sum(potencias) / len(potencias) / 1000 * 24 if potencias else 0)
     )
+    total_cost_usd = total_energy_kwh * TARIFA_KWH
 
     return {
         "total_energy_kwh": total_energy_kwh,
+        "total_cost_usd": total_cost_usd,
         "total_savings_usd": 0,
         "avg_savings_pct": 0,
         "rooms_count": 0,

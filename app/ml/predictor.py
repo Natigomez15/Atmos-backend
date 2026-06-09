@@ -8,6 +8,7 @@ import joblib
 from app.core.database import obtener_cliente
 from app.core.database import obtener_firebase
 from app.ml.atmos_logic import ejecutar_atmos
+from app.services.sincronizador_firebase import leer_ultima_lectura_valida_firebase_rest
 
 
 MODELO_ATMOS_PATH = Path(__file__).with_name("modelo_atmos (1).pkl")
@@ -45,7 +46,36 @@ class ServicioPredictor:
         self, area: str = "robotica", aire: str = "Aire_1"
     ) -> dict:
         firebase_db = obtener_firebase()
-        lectura = self.obtener_ultima_lectura_firebase(firebase_db, area, aire)
+        seleccion = self.obtener_ultima_lectura_firebase(firebase_db, area, aire)
+        if not seleccion["valida"]:
+            horario = self.obtener_estado_horario_operacion()
+            accion = "mantener"
+            firebase_db.child("Atmos").child("comandos").child(area).child(aire).update({
+                "accion": accion,
+            })
+            actualizacion_supabase = self.guardar_decision_en_registro(
+                pabellon=area,
+                aire=aire,
+                accion=accion,
+                resultado=None,
+                horario=horario,
+            )
+            return {
+                "lectura_firebase": None,
+                "lectura_valida": False,
+                "firebase_key_usado": None,
+                "lecturas_invalidas_ignoradas": seleccion["lecturas_invalidas_ignoradas"],
+                "advertencias": seleccion["advertencias"],
+                "entrada_modelo": None,
+                "resultado_modelo": None,
+                "accion": accion,
+                "horario": horario,
+                "ruta_accion": f"/Atmos/comandos/{area}/{aire}/accion",
+                "actualizacion_supabase": actualizacion_supabase,
+                "mensaje": "No habia lectura valida suficiente. Se mantiene accion segura.",
+            }
+
+        lectura = seleccion["lectura"]
         datos_atmos = self.preparar_lectura_firebase(lectura)
         if datos_atmos.get("presencia") == 0:
             datos_atmos["minutos_sin_presencia"] = self.calcular_minutos_sin_presencia(
@@ -78,6 +108,14 @@ class ServicioPredictor:
 
         return {
             "lectura_firebase": lectura,
+            "lectura_valida": True,
+            "firebase_key_usado": (
+                f"{area}_{aire}_{seleccion['firebase_key']}"
+                if seleccion.get("firebase_key")
+                else None
+            ),
+            "lecturas_invalidas_ignoradas": seleccion["lecturas_invalidas_ignoradas"],
+            "advertencias": seleccion["advertencias"],
             "entrada_modelo": datos_atmos,
             "resultado_modelo": resultado,
             "accion": accion,
@@ -134,6 +172,13 @@ class ServicioPredictor:
                 return lecturas[-1]
 
         raise ValueError("La última lectura de Firebase no tiene un formato válido")
+
+    def obtener_ultima_lectura_firebase(self, firebase_db, area: str, aire: str) -> dict:
+        return leer_ultima_lectura_valida_firebase_rest(
+            pabellon=area,
+            aire=aire,
+            limite=50,
+        )
 
     def preparar_lectura_firebase(self, lectura: dict) -> dict:
         def buscar(*claves, requerido: bool = True, defecto=None):

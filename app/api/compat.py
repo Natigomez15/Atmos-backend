@@ -188,6 +188,39 @@ async def listar_readings(
     if end:
         consulta = consulta.lte("fecha_sync", end.isoformat())
     respuesta = consulta.execute()
+    if respuesta.data:
+        return [_mapear_registro_a_reading(registro) for registro in respuesta.data]
+
+    sala_respuesta = (
+        cliente.table("rooms")
+        .select("nombre,pabellon,edificio")
+        .eq("id", str(room_id))
+        .limit(1)
+        .execute()
+    )
+    if sala_respuesta.data:
+        sala = sala_respuesta.data[0]
+        pabellon = sala.get("pabellon") or sala.get("edificio")
+        aire = sala.get("nombre")
+        if pabellon and aire:
+            consulta = (
+                cliente.table("registros")
+                .select("*")
+                .eq("pabellon", pabellon)
+                .eq("aire", aire)
+                .order("fecha_sync", desc=False)
+                .limit(limit)
+            )
+            if start:
+                consulta = consulta.gte("fecha_sync", start.isoformat())
+            if end:
+                consulta = consulta.lte("fecha_sync", end.isoformat())
+            respuesta = consulta.execute()
+            return [
+                _mapear_registro_a_reading({**registro, "sala_id": str(room_id)})
+                for registro in respuesta.data or []
+            ]
+
     return [_mapear_registro_a_reading(registro) for registro in respuesta.data]
 
 
@@ -351,6 +384,11 @@ async def reporte_energia(carga: dict | None = None):
         })
 
     return {"type": "energy", "rooms": rooms, "generated_at": datetime.now(timezone.utc).isoformat()}
+
+
+@enrutador.get("/reports/energy")
+async def reporte_energia_get():
+    return await reporte_energia()
 
 
 @enrutador.post("/reports/room/{sala_id}")

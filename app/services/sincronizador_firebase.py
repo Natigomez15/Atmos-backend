@@ -48,6 +48,15 @@ def _a_entero(valor: Any, defecto: int = 0) -> int:
         return defecto
 
 
+def _leer_numero_opcional(valor: Any) -> float | None:
+    if valor is None or valor == "":
+        return None
+    try:
+        return float(valor)
+    except (TypeError, ValueError):
+        return None
+
+
 def _a_uuid(valor: Any) -> str | None:
     if not valor:
         return None
@@ -59,6 +68,84 @@ def _a_uuid(valor: Any) -> str | None:
 
 def _normalizar_texto(valor: Any) -> str:
     return str(valor or "").strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def obtener_valor_lectura(valor: dict, *claves: str) -> Any:
+    for clave in claves:
+        if clave in valor:
+            return valor.get(clave)
+    return None
+
+
+def validar_lectura_firebase(valor: dict) -> tuple[bool, list[str]]:
+    temperatura_ambiente = _leer_numero_opcional(
+        obtener_valor_lectura(
+            valor,
+            "temperatura_ambiente",
+            "temperatura",
+            "temperatura_dht11",
+            "temp_ambiente",
+        )
+    )
+    humedad = _leer_numero_opcional(valor.get("humedad"))
+    razones: list[str] = []
+
+    if temperatura_ambiente is None:
+        razones.append("temperatura_ambiente ausente")
+    elif temperatura_ambiente == 0:
+        razones.append("temperatura_ambiente en 0")
+    elif temperatura_ambiente < 10 or temperatura_ambiente > 45:
+        razones.append("temperatura_ambiente fuera de rango")
+
+    if humedad is None:
+        razones.append("humedad ausente")
+    elif humedad <= 0:
+        razones.append("humedad en 0 o negativa")
+    elif humedad > 100:
+        razones.append("humedad fuera de rango")
+
+    return len(razones) == 0, razones
+
+
+def seleccionar_ultima_lectura_valida(lecturas: dict) -> dict:
+    if not isinstance(lecturas, dict) or not lecturas:
+        return {
+            "valida": False,
+            "firebase_key": None,
+            "lectura": None,
+            "lecturas_invalidas_ignoradas": 0,
+            "advertencias": ["No hay lecturas en Firebase"],
+        }
+
+    lecturas_invalidas = 0
+    advertencias: list[str] = []
+
+    for firebase_key, valor in reversed(sorted(lecturas.items())):
+        if not isinstance(valor, dict):
+            lecturas_invalidas += 1
+            advertencias.append(f"{firebase_key}: formato invalido")
+            continue
+
+        es_valida, razones = validar_lectura_firebase(valor)
+        if es_valida:
+            return {
+                "valida": True,
+                "firebase_key": firebase_key,
+                "lectura": valor,
+                "lecturas_invalidas_ignoradas": lecturas_invalidas,
+                "advertencias": advertencias[:10],
+            }
+
+        lecturas_invalidas += 1
+        advertencias.append(f"{firebase_key}: {', '.join(razones)}")
+
+    return {
+        "valida": False,
+        "firebase_key": None,
+        "lectura": None,
+        "lecturas_invalidas_ignoradas": lecturas_invalidas,
+        "advertencias": advertencias[:10],
+    }
 
 
 def resolver_sala_id(supabase, pabellon: str, aire: str, valor: dict) -> str | None:
@@ -217,6 +304,23 @@ def leer_ultimas_lecturas_firebase_rest(
     return datos if isinstance(datos, dict) else {}
 
 
+def leer_ultima_lectura_valida_firebase_rest(
+    pabellon: str,
+    aire: str,
+    limite: int = 50,
+) -> dict:
+    lecturas = leer_ultimas_lecturas_firebase_rest(
+        pabellon=pabellon,
+        aire=aire,
+        limite=limite,
+    )
+    seleccion = seleccionar_ultima_lectura_valida(lecturas)
+    return {
+        **seleccion,
+        "cantidad_lecturas_revisadas": len(lecturas),
+    }
+
+
 def guardar_registro_supabase_rest(registro: dict) -> dict:
     supabase_url = configuracion.SUPABASE_URL.strip().strip('"').strip("'").rstrip("/")
     supabase_key = (
@@ -277,24 +381,48 @@ def sincronizar_firebase_supabase(
 
     if pabellon_objetivo and aire_objetivo:
         inicio = time.monotonic()
-        lecturas = leer_ultimas_lecturas_firebase_rest(
+        lecturas_recientes = leer_ultimas_lecturas_firebase_rest(
             pabellon=pabellon_objetivo,
             aire=aire_objetivo,
-            limite=1,
+            limite=50,
+        )
+        seleccion = seleccionar_ultima_lectura_valida(lecturas_recientes)
+        lecturas = (
+            {seleccion["firebase_key"]: seleccion["lectura"]}
+            if seleccion["valida"]
+            else {}
         )
         etapas.append({
             "paso": "leer_firebase_rest",
             "duracion_ms": round((time.monotonic() - inicio) * 1000, 2),
-            "cantidad_lecturas": len(lecturas),
+            "cantidad_lecturas": len(lecturas_recientes),
+            "lecturas_invalidas_ignoradas": seleccion["lecturas_invalidas_ignoradas"],
+            "firebase_key_usado": seleccion["firebase_key"],
+            "lectura_valida": seleccion["valida"],
         })
+        if not seleccion["valida"]:
+            return {
+                "sincronizados": 0,
+                "errores": 0,
+                "detalles_errores": [],
+                "lectura_valida": False,
+                "lecturas_invalidas_ignoradas": seleccion["lecturas_invalidas_ignoradas"],
+                "firebase_key_usado": None,
+                "advertencias": seleccion["advertencias"],
+                "mensaje": "No hay lectura valida suficiente en Firebase.",
+                "etapas": etapas,
+                "duracion_total_ms": round((time.monotonic() - inicio_total) * 1000, 2),
+            }
         datos = {
             pabellon_objetivo: {
                 aire_objetivo: {"lecturas": lecturas or {}}
             }
         }
+        metadata_seleccion = seleccion
     else:
         firebase_db = obtener_firebase()
         datos = firebase_db.child("Atmos").child("registro").get().val()
+        metadata_seleccion = None
 
     if not datos:
         return {"sincronizados": 0, "errores": 0, "mensaje": "No hay datos en Firebase."}
@@ -358,6 +486,18 @@ def sincronizar_firebase_supabase(
         "sincronizados": sincronizados,
         "errores": errores,
         "detalles_errores": detalles_errores[:10],
+        "lectura_valida": True if metadata_seleccion else None,
+        "lecturas_invalidas_ignoradas": (
+            metadata_seleccion["lecturas_invalidas_ignoradas"]
+            if metadata_seleccion
+            else 0
+        ),
+        "firebase_key_usado": (
+            f"{pabellon_objetivo}_{aire_objetivo}_{metadata_seleccion['firebase_key']}"
+            if metadata_seleccion and metadata_seleccion["firebase_key"]
+            else None
+        ),
+        "advertencias": metadata_seleccion["advertencias"] if metadata_seleccion else [],
         "etapas": etapas,
         "duracion_total_ms": round((time.monotonic() - inicio_total) * 1000, 2),
     }

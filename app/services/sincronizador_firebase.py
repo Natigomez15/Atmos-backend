@@ -8,6 +8,7 @@ import httpx
 
 from app.config import configuracion
 from app.core.database import obtener_cliente, obtener_firebase
+from app.ml.impacto import estimar_consumo_registro, inferir_accion, inferir_ac_encendido
 
 
 ZONA_HORARIA_PANAMA = timezone(timedelta(hours=-5), "America/Panama")
@@ -130,7 +131,9 @@ def preparar_registro_supabase(
     valor: dict,
     sala_id: str | None = None,
     nodo_id: str | None = None,
+    registro_anterior: dict | None = None,
 ) -> dict:
+    fecha_sync = datetime.now(ZONA_HORARIA_PANAMA)
     temperatura_ambiente = _a_numero(
         valor.get(
             "temperatura_ambiente",
@@ -147,6 +150,21 @@ def preparar_registro_supabase(
         valor.get("delta_t"),
         temperatura_ambiente - temperatura_salida_aire,
     )
+    consumo_estimado = estimar_consumo_registro(
+        valor=valor,
+        registro_anterior=registro_anterior,
+        fecha_actual=fecha_sync,
+    )
+
+    potencia_w = _a_numero(
+        valor.get("potencia_w", valor.get("power_w")),
+        defecto=None,
+    )
+    energia_kwh = _a_numero(
+        valor.get("energia_kwh", valor.get("energy_kwh")),
+        defecto=None,
+    )
+    accion = inferir_accion(valor)
 
     return {
         "firebase_key": f"{pabellon}_{aire}_{firebase_key}",
@@ -159,14 +177,8 @@ def preparar_registro_supabase(
         "temperatura_salida_aire": temperatura_salida_aire,
         "delta_t": delta_t,
         "movimiento": _a_entero(valor.get("movimiento")),
-        "potencia_w": _a_numero(
-            valor.get("potencia_w", valor.get("power_w")),
-            defecto=None,
-        ),
-        "energia_kwh": _a_numero(
-            valor.get("energia_kwh", valor.get("energy_kwh")),
-            defecto=None,
-        ),
+        "potencia_w": potencia_w if potencia_w is not None else consumo_estimado["potencia_w"],
+        "energia_kwh": energia_kwh if energia_kwh is not None else consumo_estimado["energia_kwh"],
         "estado_ocupacion": _a_booleano(
             valor.get("estado_ocupacion", valor.get("presencia", valor.get("ocupado", 0)))
         ),
@@ -176,12 +188,12 @@ def preparar_registro_supabase(
         ),
         "control_ir_activo": _a_booleano(valor.get("control_ir_activo", False)),
         "aire_encendido_atmos": (
-            None
-            if valor.get("aire_encendido_atmos") is None
-            else _a_booleano(valor.get("aire_encendido_atmos"))
+            _a_booleano(valor.get("aire_encendido_atmos"))
+            if valor.get("aire_encendido_atmos") is not None
+            else inferir_ac_encendido(valor, registro_anterior)
         ),
-        "ultima_accion_ejecutada": valor.get("ultima_accion_ejecutada", ""),
-        "fecha_sync": datetime.now(ZONA_HORARIA_PANAMA).isoformat(),
+        "ultima_accion_ejecutada": valor.get("ultima_accion_ejecutada", accion),
+        "fecha_sync": fecha_sync.isoformat(),
     }
 
 
@@ -226,6 +238,34 @@ def guardar_registro_supabase_rest(registro: dict) -> dict:
     respuesta.raise_for_status()
     datos = respuesta.json()
     return datos[0] if isinstance(datos, list) and datos else registro
+
+
+def obtener_ultimo_registro_supabase_rest(pabellon: str, aire: str) -> dict | None:
+    supabase_url = configuracion.SUPABASE_URL.strip().strip('"').strip("'").rstrip("/")
+    supabase_key = (
+        configuracion.SUPABASE_KEY
+        .strip()
+        .strip('"')
+        .strip("'")
+        .removeprefix("Bearer ")
+        .strip()
+    )
+    parametros = urlencode({
+        "select": "firebase_key,fecha_sync,potencia_w,energia_kwh,aire_encendido_atmos,ultima_accion_ejecutada",
+        "pabellon": f"eq.{pabellon}",
+        "aire": f"eq.{aire}",
+        "order": "fecha_sync.desc",
+        "limit": "1",
+    })
+    url = f"{supabase_url}/rest/v1/registros?{parametros}"
+    headers = {
+        "apikey": supabase_key,
+        "Authorization": f"Bearer {supabase_key}",
+    }
+    respuesta = httpx.get(url, headers=headers, timeout=8)
+    respuesta.raise_for_status()
+    datos = respuesta.json()
+    return datos[0] if isinstance(datos, list) and datos else None
 
 
 def sincronizar_firebase_supabase(
@@ -282,6 +322,15 @@ def sincronizar_firebase_supabase(
 
                 sala_id = _a_uuid(valor.get("sala_id"))
                 nodo_id = _a_uuid(valor.get("nodo_id"))
+                registro_anterior = obtener_ultimo_registro_supabase_rest(pabellon, aire)
+                firebase_key_unica = f"{pabellon}_{aire}_{firebase_key}"
+                if registro_anterior and registro_anterior.get("firebase_key") == firebase_key_unica:
+                    valor = {**valor}
+                    if valor.get("potencia_w") is None and valor.get("power_w") is None:
+                        valor["potencia_w"] = registro_anterior.get("potencia_w")
+                    if valor.get("energia_kwh") is None and valor.get("energy_kwh") is None:
+                        valor["energia_kwh"] = registro_anterior.get("energia_kwh")
+                    registro_anterior = None
                 registro = preparar_registro_supabase(
                     pabellon=pabellon,
                     aire=aire,
@@ -289,6 +338,7 @@ def sincronizar_firebase_supabase(
                     valor=valor,
                     sala_id=sala_id,
                     nodo_id=nodo_id,
+                    registro_anterior=registro_anterior,
                 )
 
                 try:

@@ -10,7 +10,7 @@ from app.models.schemas import (
 from app.core.database import obtener_cliente
 from app.core.security import obtener_usuario_actual
 from app.services.notificaciones_service import (
-    enviar_notificacion_push,
+    enviar_notificacion_push_detallada,
     obtener_clave_publica_vapid,
 )
 
@@ -167,17 +167,27 @@ async def enviar_notificacion_prueba(
     )
 
     if not respuesta.data:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No hay suscripción activa para este usuario",
-        )
+        return {
+            "enviada": False,
+            "enviadas": 0,
+            "fallidas": 1,
+            "suscripciones_activas": 0,
+            "motivo": "no_hay_suscripciones_activas",
+            "detalle": "No hay suscripcion push activa para este usuario.",
+        }
 
     suscripcion = respuesta.data[0]
-    enviada = enviar_notificacion_push(
+    resultado_envio = enviar_notificacion_push_detallada(
         suscripcion=suscripcion,
         titulo="🔔 ATMOS — Notificación de prueba",
         cuerpo="Las notificaciones push están funcionando correctamente.",
         datos={"tipo": "prueba"},
     )
 
-    return {"enviada": enviada}
+    return {
+        "enviada": bool(resultado_envio.get("enviada")),
+        "enviadas": 1 if resultado_envio.get("enviada") else 0,
+        "fallidas": 0 if resultado_envio.get("enviada") else 1,
+        "suscripciones_activas": 1,
+        **resultado_envio,
+    }

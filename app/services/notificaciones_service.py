@@ -4,6 +4,7 @@ from app.core.database import obtener_cliente
 from datetime import datetime, timezone, timedelta
 from loguru import logger
 import json
+import os
 
 # Zona horaria de Panamá (UTC-5, sin horario de verano)
 ZONA_PANAMA = timezone(timedelta(hours=-5))
@@ -61,6 +62,22 @@ def esta_en_horario_usuario(suscripcion: dict) -> bool:
     return dia_coincide and hora_coincide
 
 
+def _obtener_vapid_privada() -> str:
+    clave = configuracion.vapid_clave_privada or os.getenv("VAPID_PRIVATE_KEY", "")
+    return clave.replace("\\n", "\n").strip()
+
+
+def _obtener_vapid_correo() -> str:
+    correo = (
+        configuracion.vapid_correo
+        or os.getenv("VAPID_EMAIL", "")
+        or os.getenv("VAPID_CORREO", "")
+    ).strip()
+    if correo and "@" in correo and not correo.startswith(("mailto:", "https://")):
+        return f"mailto:{correo}"
+    return correo
+
+
 def enviar_notificacion_push(
     suscripcion: dict,
     titulo:      str,
@@ -71,6 +88,17 @@ def enviar_notificacion_push(
     Envía una notificación push a un endpoint registrado.
     Nunca lanza excepciones — una falla no debe interrumpir el flujo de alertas.
     """
+    resultado = enviar_notificacion_push_detallada(suscripcion, titulo, cuerpo, datos)
+    return bool(resultado.get("enviada"))
+
+
+def enviar_notificacion_push_detallada(
+    suscripcion: dict,
+    titulo: str,
+    cuerpo: str,
+    datos: dict = None,
+) -> dict:
+    """Envia una notificacion push y devuelve diagnostico seguro."""
     datos = datos or {}
     url = datos.get("url", "/alerts")
     tipo_alerta = datos.get("tipo_alerta")
@@ -95,11 +123,32 @@ def enviar_notificacion_push(
     })
 
     try:
+        clave_privada = _obtener_vapid_privada()
+        correo_vapid = _obtener_vapid_correo()
+        if not clave_privada:
+            logger.error("VAPID privada no configurada.")
+            return {
+                "enviada": False,
+                "motivo": "vapid_privada_no_configurada",
+                "detalle": "VAPID privada no configurada en backend.",
+            }
+        if not correo_vapid:
+            logger.error("VAPID correo no configurado.")
+            return {
+                "enviada": False,
+                "motivo": "vapid_correo_no_configurado",
+                "detalle": "VAPID correo/subject no configurado en backend.",
+            }
+
         p256dh = suscripcion.get("p256dh") or suscripcion.get("clave_p256dh")
         auth = suscripcion.get("auth") or suscripcion.get("clave_auth")
         if not p256dh or not auth:
             logger.warning("Suscripcion push sin p256dh/auth; se omite envio.")
-            return False
+            return {
+                "enviada": False,
+                "motivo": "suscripcion_sin_claves",
+                "detalle": "La suscripcion no tiene p256dh/auth.",
+            }
 
         webpush(
             subscription_info={
@@ -110,8 +159,8 @@ def enviar_notificacion_push(
                 },
             },
             data=payload,
-            vapid_private_key=configuracion.vapid_clave_privada,
-            vapid_claims={"sub": configuracion.vapid_correo},
+            vapid_private_key=clave_privada,
+            vapid_claims={"sub": correo_vapid},
         )
 
         # Registrar la hora del último envío exitoso
@@ -120,11 +169,18 @@ def enviar_notificacion_push(
             {"actualizado_en": datetime.now(timezone.utc).isoformat()}
         ).eq("endpoint", suscripcion["endpoint"]).execute()
 
-        return True
+        return {"enviada": True, "motivo": "enviada"}
 
     except WebPushException as error_push:
         # Suscripción expirada o revocada por el navegador
-        if error_push.response is not None and error_push.response.status_code == 410:
+        status_code = error_push.response.status_code if error_push.response is not None else None
+        detalle_push = ""
+        try:
+            detalle_push = error_push.response.text if error_push.response is not None else ""
+        except Exception:
+            detalle_push = ""
+
+        if status_code in (404, 410):
             logger.warning(
                 f"Suscripción expirada, desactivando endpoint: {suscripcion['endpoint'][:50]}…"
             )
@@ -138,13 +194,28 @@ def enviar_notificacion_push(
                 ).eq("endpoint", suscripcion["endpoint"]).execute()
             except Exception as error_db:
                 logger.error(f"Error al desactivar suscripción expirada: {error_db}")
+            return {
+                "enviada": False,
+                "motivo": "suscripcion_expirada_o_invalida",
+                "status_push": status_code,
+                "detalle": detalle_push[:300],
+            }
         else:
             logger.error(f"Error al enviar notificación push: {error_push}")
-        return False
+            return {
+                "enviada": False,
+                "motivo": "error_pywebpush",
+                "status_push": status_code,
+                "detalle": str(error_push)[:300],
+            }
 
     except Exception as error_general:
         logger.error(f"Error inesperado en notificación push: {error_general}")
-        return False
+        return {
+            "enviada": False,
+            "motivo": "error_backend_push",
+            "detalle": str(error_general)[:300],
+        }
 
 
 def obtener_clave_publica_vapid() -> str:

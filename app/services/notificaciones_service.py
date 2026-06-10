@@ -13,6 +13,37 @@ ROLES_POR_TIPO_ALERTA: dict[str, list[str]] = {
     "node_offline":      ["admin", "mantenimiento"],
     "power_anomaly":     ["admin", "mantenimiento"],
     "temperature_stuck": ["admin", "mantenimiento"],
+    "sensor_datos_invalidos": ["admin", "mantenimiento"],
+    "temperatura_alta": ["admin", "mantenimiento"],
+    "temperatura_fuera_rango": ["admin", "mantenimiento"],
+    "humedad_alta": ["admin", "mantenimiento"],
+    "humedad_invalida": ["admin", "mantenimiento"],
+}
+
+MENSAJES_PUSH_ATMOS: dict[str, dict[str, str]] = {
+    "sensor_datos_invalidos": {
+        "titulo": "ATMOS: posible fallo de sensor",
+        "cuerpo": (
+            "Se detectaron lecturas invalidas recientes del ESP32 o sensor. "
+            "Revisa el modulo de monitoreo."
+        ),
+    },
+    "temperatura_alta": {
+        "titulo": "ATMOS: temperatura alta",
+        "cuerpo": "La temperatura ambiente supero el limite configurado.",
+    },
+    "temperatura_fuera_rango": {
+        "titulo": "ATMOS: temperatura fuera de rango",
+        "cuerpo": "Se detecto una temperatura ambiente fuera del rango logico.",
+    },
+    "humedad_alta": {
+        "titulo": "ATMOS: humedad alta",
+        "cuerpo": "La humedad supero el limite configurado.",
+    },
+    "humedad_invalida": {
+        "titulo": "ATMOS: humedad invalida",
+        "cuerpo": "Se detecto una lectura de humedad invalida.",
+    },
 }
 
 
@@ -36,12 +67,27 @@ def enviar_notificacion_push(
     Envía una notificación push a un endpoint registrado.
     Nunca lanza excepciones — una falla no debe interrumpir el flujo de alertas.
     """
+    datos = datos or {}
+    url = datos.get("url", "/alerts")
+    tipo_alerta = datos.get("tipo_alerta")
+    sala_id = datos.get("sala_id")
+    tag = datos.get("tag") or ":".join(
+        str(parte) for parte in [tipo_alerta, sala_id] if parte
+    )
+
     payload = json.dumps({
         "titulo": titulo,
+        "title": titulo,
         "cuerpo": cuerpo,
-        "datos":  datos or {},
+        "body": cuerpo,
+        "datos":  datos,
         "icono":  "/favicon.svg",
-        "url":    "/alerts",
+        "icon":   "/favicon.svg",
+        "url":    url,
+        "tipo_alerta": tipo_alerta,
+        "severidad": datos.get("severidad"),
+        "tag": tag,
+        "renotify": False,
     })
 
     try:
@@ -122,19 +168,28 @@ def notificar_alerta_push(
         logger.error(f"Error al consultar suscripciones push: {error_query}")
         return {"enviadas": 0, "fuera_de_horario": 0, "fallidas": 0}
 
+    mensaje_atmos = MENSAJES_PUSH_ATMOS.get(tipo_alerta)
+
     # Título según severidad
     titulos_por_severidad = {
         "high":   "🔴 ATMOS — Alerta Alta",
         "medium": "🟡 ATMOS — Alerta Media",
         "low":    "🟢 ATMOS — Alerta Baja",
     }
-    titulo = titulos_por_severidad.get(severidad, "⚪ ATMOS — Alerta")
-    cuerpo = f"{nombre_sala}: {mensaje}"
+    titulo = (
+        mensaje_atmos["titulo"]
+        if mensaje_atmos
+        else titulos_por_severidad.get(severidad, "⚪ ATMOS — Alerta")
+    )
+    cuerpo_base = mensaje_atmos["cuerpo"] if mensaje_atmos else mensaje
+    cuerpo = f"{nombre_sala}: {cuerpo_base}"
 
     datos_extra = {
         "tipo_alerta": tipo_alerta,
         "severidad":   severidad,
         "sala_id":     sala_id,
+        "url":         "/alerts",
+        "tag":         f"{tipo_alerta}:{sala_id or nombre_sala}",
         **(detalle or {}),
     }
 

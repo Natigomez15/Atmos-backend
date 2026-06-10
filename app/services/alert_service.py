@@ -90,6 +90,35 @@ class ServicioAlertas:
         self._emitir_alerta_ws(fila)
         return fila
 
+    def _notificar_alerta_atmos_push(self, alerta: dict) -> None:
+        tipo_alerta = alerta.get("tipo_alerta")
+        if tipo_alerta not in {
+            "sensor_datos_invalidos",
+            "temperatura_alta",
+            "temperatura_fuera_rango",
+            "humedad_alta",
+            "humedad_invalida",
+        }:
+            return
+
+        detalle = alerta.get("detalle") or {}
+        nombre_sala = detalle.get("aire") or detalle.get("pabellon") or "ATMOS"
+        try:
+            notificar_alerta_push(
+                tipo_alerta=tipo_alerta,
+                severidad=alerta.get("severidad", "medium"),
+                mensaje=alerta.get("mensaje", "Nueva alerta ATMOS"),
+                sala_id=str(alerta.get("sala_id") or ""),
+                nombre_sala=nombre_sala,
+                detalle=detalle,
+            )
+        except Exception as error:
+            log.warning({
+                "evento": "push_alerta_atmos_fallido",
+                "tipo": tipo_alerta,
+                "error": str(error),
+            })
+
     def _buscar_alerta_activa_atmos(
         self,
         cliente,
@@ -155,7 +184,9 @@ class ServicioAlertas:
             )
             return "actualizada", respuesta.data[0] if respuesta.data else existente
 
-        return "creada", self._insertar_alerta(cliente, datos)
+        alerta_creada = self._insertar_alerta(cliente, datos)
+        self._notificar_alerta_atmos_push(alerta_creada)
+        return "creada", alerta_creada
 
     def _resolver_alertas_atmos(
         self,

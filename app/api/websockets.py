@@ -36,10 +36,6 @@ async def ws_room_alias(websocket: WebSocket, sala_id: str, api_key: str | None 
 async def ws_alertas(websocket: WebSocket, api_key: str | None = None):
     sala_id = "alertas"
 
-    if not verificar_api_key(api_key):
-        await websocket.close(code=1008)
-        return
-
     await gestor.conectar(websocket, sala_id)
     log.info({"evento": "ws_conectado", "sala_id": sala_id})
 

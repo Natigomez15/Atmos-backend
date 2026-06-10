@@ -52,6 +52,11 @@ async def ws_alertas(websocket: WebSocket, api_key: str | None = None):
         log.info({"evento": "ws_desconectado", "sala_id": sala_id})
 
 
+@enrutador.websocket("/alerts")
+async def ws_alerts_alias(websocket: WebSocket, api_key: str | None = None):
+    await ws_alertas(websocket, api_key)
+
+
 @enrutador.get("/estado")
 async def estado_conexiones():
     return {

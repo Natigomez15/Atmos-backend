@@ -8,6 +8,7 @@ from app.services.sincronizador_firebase import (
     leer_ultima_lectura_valida_firebase_rest,
     sincronizar_firebase_supabase,
 )
+from app.services.alert_service import ServicioAlertas
 
 
 enrutador = APIRouter(prefix="/atmos", tags=["atmos"])
@@ -37,11 +38,24 @@ def procesar_lectura_atmos(
             area=pabellon,
             aire=aire,
         )
+        alertas = {"verificadas": False}
+        try:
+            alertas = ServicioAlertas().verificar_alertas_atmos(
+                pabellon=pabellon,
+                aire=aire,
+                diagnostico=decision.get("diagnostico") or sincronizacion.get("diagnostico"),
+            )
+        except Exception as error_alertas:
+            alertas = {
+                "verificadas": False,
+                "error": f"No se pudieron verificar alertas ATMOS: {error_alertas}",
+            }
         return {
             "sincronizacion": sincronizacion,
             "decision": decision,
             "modelo_ml": decision.get("modelo_ml"),
             "diagnostico": decision.get("diagnostico") or sincronizacion.get("diagnostico"),
+            "alertas": alertas,
             "flujo": "firebase_supabase_ml_firebase",
         }
     except ValueError as error:

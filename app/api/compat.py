@@ -2,12 +2,16 @@ from datetime import datetime, timezone
 from typing import Annotated, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 
+from app.config import configuracion
 from app.core.database import obtener_cliente
+from app.core.security import requerir_mantenimiento_o_admin
 from app.ml.impacto import TARIFA_KWH
 from app.models.schemas import SalaActualizar, SalaCrear
 from app.api.ac_commands import comando_desde_prediccion
+from app.services.alert_service import ServicioAlertas
+from app.services.sincronizador_firebase import leer_ultima_lectura_valida_firebase_rest
 
 
 enrutador = APIRouter(tags=["compatibilidad"])
@@ -44,6 +48,21 @@ def _mapear_sala(sala: dict) -> dict:
         "pavilion": sala.get("pabellon") or sala.get("edificio"),
         "floor": sala.get("piso"),
         "capacity": sala.get("capacidad"),
+    }
+
+
+def _mapear_alerta(alerta: dict) -> dict:
+    return {
+        **alerta,
+        "room_id": alerta.get("sala_id"),
+        "node_id": alerta.get("nodo_id"),
+        "alert_type": alerta.get("tipo_alerta"),
+        "severity": alerta.get("severidad"),
+        "message": alerta.get("mensaje"),
+        "detail": alerta.get("detalle"),
+        "is_resolved": alerta.get("esta_resuelta"),
+        "created_at": alerta.get("creado_en"),
+        "resolved_at": alerta.get("resuelto_en"),
     }
 
 
@@ -227,6 +246,9 @@ async def listar_readings(
 @enrutador.get("/alerts")
 async def listar_alerts(
     is_resolved: Optional[bool] = None,
+    severity: Optional[str] = None,
+    alert_type: Optional[str] = None,
+    room_id: Optional[UUID] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ):
     cliente = obtener_cliente()
@@ -238,8 +260,14 @@ async def listar_alerts(
     )
     if is_resolved is not None:
         consulta = consulta.eq("esta_resuelta", is_resolved)
+    if severity is not None:
+        consulta = consulta.eq("severidad", severity)
+    if alert_type is not None:
+        consulta = consulta.eq("tipo_alerta", alert_type)
+    if room_id is not None:
+        consulta = consulta.eq("sala_id", str(room_id))
     respuesta = consulta.execute()
-    return respuesta.data
+    return [_mapear_alerta(alerta) for alerta in respuesta.data]
 
 
 @enrutador.get("/alerts/summary")
@@ -260,7 +288,61 @@ async def resumen_alerts():
             "medium": sum(1 for fila in filas if fila.get("severidad") == "medium"),
             "low": sum(1 for fila in filas if fila.get("severidad") == "low"),
         },
+        "by_type": {
+            tipo: sum(1 for fila in filas if fila.get("tipo_alerta") == tipo)
+            for tipo in {
+                "node_offline",
+                "power_anomaly",
+                "temperature_stuck",
+                "sensor_datos_invalidos",
+                "temperatura_alta",
+                "temperatura_fuera_rango",
+                "humedad_alta",
+                "humedad_invalida",
+            }
+        },
     }
+
+
+@enrutador.patch("/alerts/{alerta_id}/resolve")
+async def resolver_alert_alias(alerta_id: int, _=Depends(requerir_mantenimiento_o_admin)):
+    cliente = obtener_cliente()
+    existente = (
+        cliente.table("alerts").select("*").eq("id", alerta_id).single().execute()
+    )
+    if not existente.data:
+        raise HTTPException(status_code=404, detail="Alerta no encontrada")
+    if existente.data.get("esta_resuelta"):
+        raise HTTPException(status_code=409, detail="La alerta ya esta resuelta")
+
+    ahora = datetime.now(timezone.utc).isoformat()
+    respuesta = (
+        cliente.table("alerts")
+        .update({"esta_resuelta": True, "resuelto_en": ahora})
+        .eq("id", alerta_id)
+        .execute()
+    )
+    return _mapear_alerta(respuesta.data[0])
+
+
+@enrutador.post("/alerts/run-checks")
+async def ejecutar_checks_alerts_alias(
+    x_cron_secret: Annotated[Optional[str], Header()] = None,
+    pabellon: str = "robotica",
+    aire: str = "Aire_1",
+):
+    if not x_cron_secret or x_cron_secret != configuracion.CRON_SECRET:
+        raise HTTPException(status_code=401, detail="No autorizado")
+    seleccion = leer_ultima_lectura_valida_firebase_rest(
+        pabellon=pabellon,
+        aire=aire,
+        limite=50,
+    )
+    return ServicioAlertas().verificar_alertas_atmos(
+        pabellon=pabellon,
+        aire=aire,
+        diagnostico=seleccion.get("diagnostico"),
+    )
 
 
 @enrutador.get("/reports/summary/pavilion")

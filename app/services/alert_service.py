@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from app.core.database import obtener_cliente
 from app.core.logger import log
 from app.core.websocket_manager import gestor
+from app.services.notificaciones_service import notificar_alerta_push
 
 
 def _ahora() -> datetime:
@@ -39,7 +40,45 @@ class ServicioAlertas:
             consulta = consulta.eq("nodo_id", nodo_id)
         return bool(consulta.execute().data)
 
+    def _emitir_alerta_ws(self, alerta: dict) -> None:
+        payload = {
+            "tipo": "nueva_alerta",
+            "type": "new_alert",
+            "alerta": alerta,
+            "alert": {
+                "id": alerta.get("id"),
+                "room_id": alerta.get("sala_id"),
+                "node_id": alerta.get("nodo_id"),
+                "alert_type": alerta.get("tipo_alerta"),
+                "severity": alerta.get("severidad"),
+                "message": alerta.get("mensaje"),
+                "detail": alerta.get("detalle"),
+                "is_resolved": alerta.get("esta_resuelta"),
+                "created_at": alerta.get("creado_en"),
+                "resolved_at": alerta.get("resuelto_en"),
+            },
+            "tipo_alerta": alerta.get("tipo_alerta"),
+            "alert_type": alerta.get("tipo_alerta"),
+            "severidad": alerta.get("severidad"),
+            "severity": alerta.get("severidad"),
+            "sala_id": str(alerta.get("sala_id", "")),
+            "room_id": str(alerta.get("sala_id", "")),
+            "mensaje": alerta.get("mensaje"),
+            "message": alerta.get("mensaje"),
+        }
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(gestor.transmitir_a_todos(payload))
+        except RuntimeError:
+            # El servicio puede ejecutarse desde un endpoint sync en threadpool.
+            pass
+
     def _insertar_alerta(self, cliente, alerta: dict) -> dict:
+        alerta = {
+            "esta_resuelta": False,
+            "creado_en": _iso(_ahora()),
+            **alerta,
+        }
         respuesta = cliente.table("alerts").insert(alerta).execute()
         fila = respuesta.data[0]
         log.warning({
@@ -48,15 +87,306 @@ class ServicioAlertas:
             "severidad":  alerta.get("severidad"),
             "sala_id":    str(alerta.get("sala_id", "")),
         })
-        # Broadcast a todos los clientes WebSocket conectados
-        asyncio.create_task(gestor.transmitir_a_todos({
-            "tipo":        "nueva_alerta",
-            "tipo_alerta": alerta.get("tipo_alerta"),
-            "severidad":   alerta.get("severidad"),
-            "sala_id":     str(alerta.get("sala_id", "")),
-            "mensaje":     alerta.get("mensaje"),
-        }))
+        self._emitir_alerta_ws(fila)
         return fila
+
+    def _buscar_alerta_activa_atmos(
+        self,
+        cliente,
+        tipo_alerta: str,
+        sala_id: str | None,
+        pabellon: str,
+        aire: str,
+    ) -> dict | None:
+        consulta = (
+            cliente.table("alerts")
+            .select("*")
+            .eq("tipo_alerta", tipo_alerta)
+            .eq("esta_resuelta", False)
+        )
+        if sala_id:
+            consulta = consulta.eq("sala_id", sala_id)
+
+        filas = consulta.execute().data or []
+        if sala_id:
+            return filas[0] if filas else None
+
+        for fila in filas:
+            detalle = fila.get("detalle") or {}
+            if detalle.get("pabellon") == pabellon and detalle.get("aire") == aire:
+                return fila
+        return None
+
+    def _crear_o_actualizar_alerta_atmos(
+        self,
+        cliente,
+        tipo_alerta: str,
+        severidad: str,
+        mensaje: str,
+        detalle: dict,
+        sala_id: str | None = None,
+    ) -> tuple[str, dict]:
+        existente = self._buscar_alerta_activa_atmos(
+            cliente=cliente,
+            tipo_alerta=tipo_alerta,
+            sala_id=sala_id,
+            pabellon=detalle.get("pabellon"),
+            aire=detalle.get("aire"),
+        )
+        datos = {
+            "sala_id": sala_id,
+            "nodo_id": None,
+            "tipo_alerta": tipo_alerta,
+            "severidad": severidad,
+            "mensaje": mensaje,
+            "detalle": detalle,
+            "esta_resuelta": False,
+        }
+        if existente:
+            respuesta = (
+                cliente.table("alerts")
+                .update({
+                    "severidad": severidad,
+                    "mensaje": mensaje,
+                    "detalle": detalle,
+                })
+                .eq("id", existente["id"])
+                .execute()
+            )
+            return "actualizada", respuesta.data[0] if respuesta.data else existente
+
+        return "creada", self._insertar_alerta(cliente, datos)
+
+    def _resolver_alertas_atmos(
+        self,
+        cliente,
+        tipos: list[str],
+        sala_id: str | None,
+        pabellon: str,
+        aire: str,
+    ) -> int:
+        total = 0
+        for tipo_alerta in tipos:
+            alerta = self._buscar_alerta_activa_atmos(
+                cliente=cliente,
+                tipo_alerta=tipo_alerta,
+                sala_id=sala_id,
+                pabellon=pabellon,
+                aire=aire,
+            )
+            if alerta:
+                self._resolver_alertas(cliente, [alerta["id"]])
+                total += 1
+        return total
+
+    def _resolver_sala_id(self, cliente, pabellon: str, aire: str) -> str | None:
+        try:
+            respuesta = (
+                cliente.table("rooms")
+                .select("id,nombre,pabellon,edificio")
+                .or_(f"pabellon.eq.{pabellon},edificio.eq.{pabellon}")
+                .execute()
+            )
+        except Exception:
+            return None
+
+        salas = respuesta.data or []
+        for sala in salas:
+            if str(sala.get("nombre") or "").strip().lower() == aire.strip().lower():
+                return sala.get("id")
+        if len(salas) == 1:
+            return salas[0].get("id")
+        return None
+
+    def _ultimo_registro_atmos(self, cliente, pabellon: str, aire: str) -> dict | None:
+        respuesta = (
+            cliente.table("registros")
+            .select("*")
+            .eq("pabellon", pabellon)
+            .eq("aire", aire)
+            .order("fecha_sync", desc=True)
+            .limit(1)
+            .execute()
+        )
+        return respuesta.data[0] if respuesta.data else None
+
+    def verificar_alertas_atmos(
+        self,
+        pabellon: str = "robotica",
+        aire: str = "Aire_1",
+        diagnostico: dict | None = None,
+    ) -> dict:
+        cliente = obtener_cliente()
+        sala_id = self._resolver_sala_id(cliente, pabellon, aire)
+        creadas = 0
+        actualizadas = 0
+        resueltas = 0
+        tipos: list[str] = []
+        errores: list[str] = []
+
+        if diagnostico and diagnostico.get("posible_fallo_sensor") is True:
+            detalle = {
+                "pabellon": pabellon,
+                "aire": aire,
+                "lecturas_revisadas": diagnostico.get("lecturas_revisadas"),
+                "lecturas_validas": diagnostico.get("lecturas_validas"),
+                "lecturas_invalidas": diagnostico.get("lecturas_invalidas"),
+                "porcentaje_invalidas": diagnostico.get("porcentaje_invalidas"),
+                "estado_sensor": diagnostico.get("estado_sensor"),
+                "ultima_lectura_recibida_key": diagnostico.get("ultima_lectura_recibida_key"),
+                "ultima_lectura_valida_key": diagnostico.get("ultima_lectura_valida_key"),
+                "fuente": "atmos_diagnostico",
+            }
+            estado, _alerta = self._crear_o_actualizar_alerta_atmos(
+                cliente=cliente,
+                tipo_alerta="sensor_datos_invalidos",
+                severidad="high",
+                mensaje=(
+                    "Se detectaron lecturas invalidas recientes del ESP32 o sensor. "
+                    "El sistema esta usando la ultima lectura valida disponible."
+                ),
+                detalle=detalle,
+                sala_id=sala_id,
+            )
+            creadas += 1 if estado == "creada" else 0
+            actualizadas += 1 if estado == "actualizada" else 0
+            tipos.append("sensor_datos_invalidos")
+        else:
+            resueltas += self._resolver_alertas_atmos(
+                cliente,
+                ["sensor_datos_invalidos"],
+                sala_id,
+                pabellon,
+                aire,
+            )
+
+        registro = self._ultimo_registro_atmos(cliente, pabellon, aire)
+        if not registro:
+            return {
+                "verificadas": True,
+                "creadas": creadas,
+                "actualizadas": actualizadas,
+                "resueltas": resueltas,
+                "tipos": tipos,
+                "errores": errores,
+                "mensaje": "No hay registros para evaluar alertas ATMOS.",
+            }
+
+        def _numero(valor):
+            try:
+                return float(valor)
+            except (TypeError, ValueError):
+                return None
+
+        temperatura = _numero(registro.get("temperatura_ambiente"))
+        humedad = _numero(registro.get("humedad"))
+        fecha_sync = registro.get("fecha_sync")
+
+        if temperatura is not None and temperatura != 0 and temperatura > 32:
+            detalle = {
+                "temperatura_ambiente": temperatura,
+                "pabellon": pabellon,
+                "aire": aire,
+                "fecha_sync": fecha_sync,
+                "fuente": "registros",
+            }
+            estado, _alerta = self._crear_o_actualizar_alerta_atmos(
+                cliente,
+                "temperatura_alta",
+                "medium",
+                f"Temperatura ambiente alta en {aire}.",
+                detalle,
+                sala_id,
+            )
+            creadas += 1 if estado == "creada" else 0
+            actualizadas += 1 if estado == "actualizada" else 0
+            tipos.append("temperatura_alta")
+        elif temperatura is not None and temperatura < 10:
+            detalle = {
+                "temperatura_ambiente": temperatura,
+                "pabellon": pabellon,
+                "aire": aire,
+                "fecha_sync": fecha_sync,
+                "fuente": "registros",
+            }
+            estado, _alerta = self._crear_o_actualizar_alerta_atmos(
+                cliente,
+                "temperatura_fuera_rango",
+                "high",
+                f"Temperatura ambiente fuera de rango en {aire}.",
+                detalle,
+                sala_id,
+            )
+            creadas += 1 if estado == "creada" else 0
+            actualizadas += 1 if estado == "actualizada" else 0
+            tipos.append("temperatura_fuera_rango")
+        else:
+            resueltas += self._resolver_alertas_atmos(
+                cliente,
+                ["temperatura_alta", "temperatura_fuera_rango"],
+                sala_id,
+                pabellon,
+                aire,
+            )
+
+        if humedad is not None and humedad > 85:
+            detalle = {
+                "humedad": humedad,
+                "pabellon": pabellon,
+                "aire": aire,
+                "fecha_sync": fecha_sync,
+                "fuente": "registros",
+            }
+            estado, _alerta = self._crear_o_actualizar_alerta_atmos(
+                cliente,
+                "humedad_alta",
+                "medium",
+                f"Humedad alta en {aire}.",
+                detalle,
+                sala_id,
+            )
+            creadas += 1 if estado == "creada" else 0
+            actualizadas += 1 if estado == "actualizada" else 0
+            tipos.append("humedad_alta")
+        elif humedad is not None and humedad <= 0 and not (
+            diagnostico and diagnostico.get("posible_fallo_sensor") is True
+        ):
+            detalle = {
+                "humedad": humedad,
+                "pabellon": pabellon,
+                "aire": aire,
+                "fecha_sync": fecha_sync,
+                "fuente": "registros",
+            }
+            estado, _alerta = self._crear_o_actualizar_alerta_atmos(
+                cliente,
+                "humedad_invalida",
+                "high",
+                f"Humedad invalida en {aire}.",
+                detalle,
+                sala_id,
+            )
+            creadas += 1 if estado == "creada" else 0
+            actualizadas += 1 if estado == "actualizada" else 0
+            tipos.append("humedad_invalida")
+        else:
+            resueltas += self._resolver_alertas_atmos(
+                cliente,
+                ["humedad_alta", "humedad_invalida"],
+                sala_id,
+                pabellon,
+                aire,
+            )
+
+        return {
+            "verificadas": True,
+            "creadas": creadas,
+            "actualizadas": actualizadas,
+            "resueltas": resueltas,
+            "tipos": sorted(set(tipos)),
+            "errores": errores,
+            "fuente": "registros_atmos_diagnostico",
+        }
 
     def _resolver_alertas(self, cliente, ids: list[int]) -> None:
         if not ids:
@@ -104,11 +434,12 @@ class ServicioAlertas:
                 "mensaje":     mensaje_alerta,
                 "detalle":     detalle_alerta,
             })
-            notificar_alerta(
+            notificar_alerta_push(
                 tipo_alerta="node_offline",
                 severidad="high",
                 mensaje=mensaje_alerta,
                 sala_id=str(nodo["sala_id"]),
+                nombre_sala=str(nodo["sala_id"]),
                 detalle=detalle_alerta,
             )
             alertas_creadas.append(alerta)
@@ -207,11 +538,12 @@ class ServicioAlertas:
                 "mensaje":     mensaje_alerta,
                 "detalle":     detalle_alerta,
             })
-            notificar_alerta(
+            notificar_alerta_push(
                 tipo_alerta="power_anomaly",
                 severidad="medium",
                 mensaje=mensaje_alerta,
                 sala_id=str(sala_id),
+                nombre_sala=nombre_sala,
                 detalle=detalle_alerta,
             )
             alertas_creadas.append(alerta)
@@ -301,11 +633,12 @@ class ServicioAlertas:
                 "mensaje":     mensaje_alerta,
                 "detalle":     detalle_alerta,
             })
-            notificar_alerta(
+            notificar_alerta_push(
                 tipo_alerta="temperature_stuck",
                 severidad="medium",
                 mensaje=mensaje_alerta,
                 sala_id=str(sala_id),
+                nombre_sala=nombre_sala,
                 detalle=detalle_alerta,
             )
             alertas_creadas.append(alerta)

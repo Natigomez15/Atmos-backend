@@ -166,7 +166,7 @@ class AlertaRespuesta(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
-    sala_id: UUID
+    sala_id: Optional[UUID] = None
     nodo_id: Optional[UUID] = None
     tipo_alerta: str
     severidad: str

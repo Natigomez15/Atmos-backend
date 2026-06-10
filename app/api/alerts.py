@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Query, Header, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Header, Request
 from datetime import datetime, timezone
 from typing import Annotated, Literal, Optional
 from uuid import UUID
@@ -8,6 +8,8 @@ from app.core.database import obtener_cliente
 from app.services.alert_service import ServicioAlertas
 from app.config import configuracion
 from app.core.limiter import limitador
+from app.core.security import requerir_mantenimiento_o_admin
+from app.services.sincronizador_firebase import leer_ultima_lectura_valida_firebase_rest
 
 enrutador = APIRouter(prefix="/alertas", tags=["alertas"])
 
@@ -19,6 +21,7 @@ async def listar_alertas(
     sala_id: Optional[UUID] = None,
     esta_resuelta: Optional[bool] = False,
     severidad: Optional[Literal["low", "medium", "high"]] = None,
+    tipo_alerta: Optional[str] = None,
     limite: Annotated[int, Query(ge=1, le=200)] = 50,
 ):
     cliente = obtener_cliente()
@@ -34,13 +37,15 @@ async def listar_alertas(
         consulta = consulta.eq("esta_resuelta", esta_resuelta)
     if severidad is not None:
         consulta = consulta.eq("severidad", severidad)
+    if tipo_alerta is not None:
+        consulta = consulta.eq("tipo_alerta", tipo_alerta)
 
     respuesta = consulta.execute()
     return respuesta.data
 
 
 @enrutador.patch("/{alerta_id}/resolver", response_model=AlertaRespuesta)
-async def resolver_alerta(alerta_id: int):
+async def resolver_alerta(alerta_id: int, _=Depends(requerir_mantenimiento_o_admin)):
     cliente = obtener_cliente()
 
     existente = (
@@ -75,7 +80,16 @@ async def resumen_alertas(request: Request):
 
     total = len(filas)
     por_severidad = {"high": 0, "medium": 0, "low": 0}
-    por_tipo = {"node_offline": 0, "power_anomaly": 0, "temperature_stuck": 0}
+    por_tipo = {
+        "node_offline": 0,
+        "power_anomaly": 0,
+        "temperature_stuck": 0,
+        "sensor_datos_invalidos": 0,
+        "temperatura_alta": 0,
+        "temperatura_fuera_rango": 0,
+        "humedad_alta": 0,
+        "humedad_invalida": 0,
+    }
 
     for fila in filas:
         sev = fila.get("severidad")
@@ -99,4 +113,25 @@ async def ejecutar_verificaciones(
     if not x_cron_secret or x_cron_secret != configuracion.CRON_SECRET:
         raise HTTPException(status_code=401, detail="No autorizado")
     resultado = ServicioAlertas().ejecutar_todas_las_verificaciones()
+    return resultado
+
+
+@enrutador.post("/ejecutar-verificaciones-atmos")
+async def ejecutar_verificaciones_atmos(
+    x_cron_secret: Annotated[Optional[str], Header()] = None,
+    pabellon: str = "robotica",
+    aire: str = "Aire_1",
+):
+    if not x_cron_secret or x_cron_secret != configuracion.CRON_SECRET:
+        raise HTTPException(status_code=401, detail="No autorizado")
+    seleccion = leer_ultima_lectura_valida_firebase_rest(
+        pabellon=pabellon,
+        aire=aire,
+        limite=50,
+    )
+    resultado = ServicioAlertas().verificar_alertas_atmos(
+        pabellon=pabellon,
+        aire=aire,
+        diagnostico=seleccion.get("diagnostico"),
+    )
     return resultado

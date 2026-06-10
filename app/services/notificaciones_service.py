@@ -7,6 +7,7 @@ import json
 
 # Zona horaria de Panamá (UTC-5, sin horario de verano)
 ZONA_PANAMA = timezone(timedelta(hours=-5))
+TABLA_SUSCRIPCIONES_PUSH = "push_subscriptions"
 
 # Roles destinatarios según tipo de alerta
 ROLES_POR_TIPO_ALERTA: dict[str, list[str]] = {
@@ -49,6 +50,9 @@ MENSAJES_PUSH_ATMOS: dict[str, dict[str, str]] = {
 
 def esta_en_horario_usuario(suscripcion: dict) -> bool:
     """Retorna True si la hora actual (Panamá) cae dentro del horario configurado."""
+    if not all(campo in suscripcion for campo in ("dias_activos", "hora_inicio", "hora_fin")):
+        return True
+
     ahora = datetime.now(ZONA_PANAMA)
     dias_activos = [int(d) for d in suscripcion["dias_activos"].split(",")]
 
@@ -91,12 +95,18 @@ def enviar_notificacion_push(
     })
 
     try:
+        p256dh = suscripcion.get("p256dh") or suscripcion.get("clave_p256dh")
+        auth = suscripcion.get("auth") or suscripcion.get("clave_auth")
+        if not p256dh or not auth:
+            logger.warning("Suscripcion push sin p256dh/auth; se omite envio.")
+            return False
+
         webpush(
             subscription_info={
                 "endpoint": suscripcion["endpoint"],
                 "keys": {
-                    "p256dh": suscripcion["clave_p256dh"],
-                    "auth":   suscripcion["clave_auth"],
+                    "p256dh": p256dh,
+                    "auth":   auth,
                 },
             },
             data=payload,
@@ -106,8 +116,8 @@ def enviar_notificacion_push(
 
         # Registrar la hora del último envío exitoso
         cliente = obtener_cliente()
-        cliente.table("suscripciones_push").update(
-            {"ultima_notificacion": datetime.now(timezone.utc).isoformat()}
+        cliente.table(TABLA_SUSCRIPCIONES_PUSH).update(
+            {"actualizado_en": datetime.now(timezone.utc).isoformat()}
         ).eq("endpoint", suscripcion["endpoint"]).execute()
 
         return True
@@ -120,8 +130,11 @@ def enviar_notificacion_push(
             )
             try:
                 cliente = obtener_cliente()
-                cliente.table("suscripciones_push").update(
-                    {"esta_activa": False}
+                cliente.table(TABLA_SUSCRIPCIONES_PUSH).update(
+                    {
+                        "activa": False,
+                        "actualizado_en": datetime.now(timezone.utc).isoformat(),
+                    }
                 ).eq("endpoint", suscripcion["endpoint"]).execute()
             except Exception as error_db:
                 logger.error(f"Error al desactivar suscripción expirada: {error_db}")
@@ -153,14 +166,14 @@ def notificar_alerta_push(
     """
     roles_objetivo = ROLES_POR_TIPO_ALERTA.get(tipo_alerta, ["admin"])
 
-    # Obtener suscripciones activas con los roles correspondientes
+    # Obtener suscripciones activas. La tabla push_subscriptions guarda
+    # dispositivos; la autorizacion ocurre al suscribirse.
     try:
         cliente = obtener_cliente()
         respuesta = (
-            cliente.table("suscripciones_push")
+            cliente.table(TABLA_SUSCRIPCIONES_PUSH)
             .select("*")
-            .eq("esta_activa", True)
-            .in_("rol", roles_objetivo)
+            .eq("activa", True)
             .execute()
         )
         suscripciones = respuesta.data or []
@@ -198,6 +211,10 @@ def notificar_alerta_push(
     conteo_fallidas        = 0
 
     for suscripcion in suscripciones:
+        rol = suscripcion.get("rol")
+        if rol and rol not in roles_objetivo:
+            continue
+
         if not esta_en_horario_usuario(suscripcion):
             conteo_fuera_horario += 1
             continue

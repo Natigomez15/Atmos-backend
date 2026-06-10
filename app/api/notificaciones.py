@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from datetime import datetime, timezone
 
 from app.models.schemas import (
@@ -14,6 +14,7 @@ from app.services.notificaciones_service import (
 )
 
 enrutador = APIRouter(prefix="/notificaciones", tags=["notificaciones"])
+TABLA_SUSCRIPCIONES_PUSH = "push_subscriptions"
 
 
 @enrutador.get("/clave-publica")
@@ -30,28 +31,50 @@ async def obtener_clave_publica():
 async def suscribir_notificaciones(
     datos: SuscripcionPushCrear,
     usuario_actual: dict = Depends(obtener_usuario_actual),
+    user_agent: str | None = Header(default=None),
 ):
     """Registra o actualiza una suscripción push para el usuario autenticado."""
     cliente = obtener_cliente()
+    ahora = datetime.now(timezone.utc).isoformat()
 
-    fila = {
-        "usuario_id":   usuario_actual["id"],
-        "rol":          usuario_actual["rol"],
-        "endpoint":     datos.endpoint,
-        "clave_p256dh": datos.clave_p256dh,
-        "clave_auth":   datos.clave_auth,
-        "dias_activos": datos.dias_activos,
-        "hora_inicio":  datos.hora_inicio,
-        "hora_fin":     datos.hora_fin,
-        "esta_activa":  True,
+    if not datos.llave_p256dh or not datos.llave_auth:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="La suscripcion debe incluir p256dh y auth",
+        )
+
+    fila_base = {
+        "profile_id": usuario_actual["id"],
+        "endpoint": datos.endpoint,
+        "p256dh": datos.llave_p256dh,
+        "auth": datos.llave_auth,
+        "permiso": datos.permiso,
+        "user_agent": datos.user_agent or user_agent,
+        "activa": True,
+        "actualizado_en": ahora,
     }
 
-    # Upsert por endpoint (restricción UNIQUE de la tabla)
-    respuesta = (
-        cliente.table("suscripciones_push")
-        .upsert(fila, on_conflict="endpoint")
+    existente = (
+        cliente.table(TABLA_SUSCRIPCIONES_PUSH)
+        .select("id")
+        .eq("endpoint", datos.endpoint)
+        .limit(1)
         .execute()
     )
+
+    if existente.data:
+        respuesta = (
+            cliente.table(TABLA_SUSCRIPCIONES_PUSH)
+            .update(fila_base)
+            .eq("endpoint", datos.endpoint)
+            .execute()
+        )
+    else:
+        respuesta = (
+            cliente.table(TABLA_SUSCRIPCIONES_PUSH)
+            .insert({**fila_base, "creado_en": ahora})
+            .execute()
+        )
 
     if not respuesta.data:
         raise HTTPException(
@@ -70,17 +93,21 @@ async def actualizar_horario_notificaciones(
     """Actualiza el horario o estado de las suscripciones del usuario."""
     cliente = obtener_cliente()
 
-    campos = {k: v for k, v in cambios.model_dump().items() if v is not None}
-    if not campos:
+    datos_cambios = cambios.model_dump()
+    campos = {}
+    if datos_cambios.get("esta_activa") is not None:
+        campos["activa"] = datos_cambios["esta_activa"]
+    campos["actualizado_en"] = datetime.now(timezone.utc).isoformat()
+    if set(campos.keys()) == {"actualizado_en"}:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Se debe enviar al menos un campo para actualizar",
+            detail="La tabla push_subscriptions solo permite actualizar activa desde este endpoint",
         )
 
     respuesta = (
-        cliente.table("suscripciones_push")
+        cliente.table(TABLA_SUSCRIPCIONES_PUSH)
         .update(campos)
-        .eq("usuario_id", usuario_actual["id"])
+        .eq("profile_id", usuario_actual["id"])
         .execute()
     )
 
@@ -100,9 +127,12 @@ async def cancelar_suscripcion(
     """Desactiva todas las suscripciones push del usuario."""
     cliente = obtener_cliente()
 
-    cliente.table("suscripciones_push").update(
-        {"esta_activa": False}
-    ).eq("usuario_id", usuario_actual["id"]).execute()
+    cliente.table(TABLA_SUSCRIPCIONES_PUSH).update(
+        {
+            "activa": False,
+            "actualizado_en": datetime.now(timezone.utc).isoformat(),
+        }
+    ).eq("profile_id", usuario_actual["id"]).execute()
 
     return {"cancelada": True}
 
@@ -115,10 +145,10 @@ async def enviar_notificacion_prueba(
     cliente = obtener_cliente()
 
     respuesta = (
-        cliente.table("suscripciones_push")
+        cliente.table(TABLA_SUSCRIPCIONES_PUSH)
         .select("*")
-        .eq("usuario_id", usuario_actual["id"])
-        .eq("esta_activa", True)
+        .eq("profile_id", usuario_actual["id"])
+        .eq("activa", True)
         .limit(1)
         .execute()
     )

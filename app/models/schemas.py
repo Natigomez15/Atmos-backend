@@ -182,25 +182,41 @@ class AlertaRespuesta(BaseModel):
 # ---------------------------------------------------------------------------
 
 class SuscripcionPushCrear(BaseModel):
-    endpoint:     str
-    clave_p256dh: str
-    clave_auth:   str
+    endpoint: str
+    p256dh: Optional[str] = None
+    auth: Optional[str] = None
+    clave_p256dh: Optional[str] = None
+    clave_auth: Optional[str] = None
+    permiso: str = "granted"
+    user_agent: Optional[str] = None
     # días separados por coma: 0=lunes, 6=domingo
     dias_activos: str = "0,1,2,3,4"
-    hora_inicio:  int = Field(7,  ge=0, le=23)
-    hora_fin:     int = Field(18, ge=0, le=23)
+    hora_inicio: int = Field(7, ge=0, le=23)
+    hora_fin: int = Field(18, ge=0, le=23)
+
+    @property
+    def llave_p256dh(self) -> str:
+        return self.p256dh or self.clave_p256dh or ""
+
+    @property
+    def llave_auth(self) -> str:
+        return self.auth or self.clave_auth or ""
 
 
 class SuscripcionPushRespuesta(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
-    id:           int
-    endpoint:     str
-    dias_activos: str
-    hora_inicio:  int
-    hora_fin:     int
-    esta_activa:  bool
-    creado_en:    datetime
+    id: Optional[int] = None
+    profile_id: Optional[UUID] = None
+    usuario_id: Optional[UUID] = None
+    endpoint: str
+    p256dh: Optional[str] = None
+    auth: Optional[str] = None
+    permiso: Optional[str] = None
+    user_agent: Optional[str] = None
+    activa: Optional[bool] = None
+    creado_en: Optional[datetime] = None
+    actualizado_en: Optional[datetime] = None
 
 
 class ActualizarHorarioNotificaciones(BaseModel):

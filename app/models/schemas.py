@@ -185,6 +185,7 @@ class SuscripcionPushCrear(BaseModel):
     endpoint: str
     p256dh: Optional[str] = None
     auth: Optional[str] = None
+    keys: Optional[dict] = None
     clave_p256dh: Optional[str] = None
     clave_auth: Optional[str] = None
     permiso: str = "granted"
@@ -196,17 +197,17 @@ class SuscripcionPushCrear(BaseModel):
 
     @property
     def llave_p256dh(self) -> str:
-        return self.p256dh or self.clave_p256dh or ""
+        return self.p256dh or self.clave_p256dh or (self.keys or {}).get("p256dh") or ""
 
     @property
     def llave_auth(self) -> str:
-        return self.auth or self.clave_auth or ""
+        return self.auth or self.clave_auth or (self.keys or {}).get("auth") or ""
 
 
 class SuscripcionPushRespuesta(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
-    id: Optional[int] = None
+    id: Optional[UUID | int] = None
     profile_id: Optional[UUID] = None
     usuario_id: Optional[UUID] = None
     endpoint: str

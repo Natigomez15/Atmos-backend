@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from datetime import datetime, timezone
+from loguru import logger
 
 from app.models.schemas import (
     SuscripcionPushCrear,
@@ -54,27 +55,39 @@ async def suscribir_notificaciones(
         "actualizado_en": ahora,
     }
 
-    existente = (
-        cliente.table(TABLA_SUSCRIPCIONES_PUSH)
-        .select("id")
-        .eq("endpoint", datos.endpoint)
-        .limit(1)
-        .execute()
-    )
-
-    if existente.data:
-        respuesta = (
+    try:
+        existente = (
             cliente.table(TABLA_SUSCRIPCIONES_PUSH)
-            .update(fila_base)
+            .select("id")
             .eq("endpoint", datos.endpoint)
+            .limit(1)
             .execute()
         )
-    else:
-        respuesta = (
-            cliente.table(TABLA_SUSCRIPCIONES_PUSH)
-            .insert({**fila_base, "creado_en": ahora})
-            .execute()
-        )
+
+        if existente.data:
+            respuesta = (
+                cliente.table(TABLA_SUSCRIPCIONES_PUSH)
+                .update(fila_base)
+                .eq("endpoint", datos.endpoint)
+                .execute()
+            )
+        else:
+            respuesta = (
+                cliente.table(TABLA_SUSCRIPCIONES_PUSH)
+                .insert({**fila_base, "creado_en": ahora})
+                .execute()
+            )
+    except Exception as error:
+        logger.error({
+            "evento": "push_subscription_save_failed",
+            "tabla": TABLA_SUSCRIPCIONES_PUSH,
+            "profile_id": usuario_actual.get("id"),
+            "error": str(error),
+        })
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"No se pudo guardar la suscripcion push en {TABLA_SUSCRIPCIONES_PUSH}: {error}",
+        ) from error
 
     if not respuesta.data:
         raise HTTPException(

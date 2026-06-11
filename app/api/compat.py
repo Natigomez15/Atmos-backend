@@ -2,7 +2,10 @@ from datetime import datetime, timezone
 from typing import Annotated, Optional
 from uuid import UUID
 
+import csv
+import io
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
 
 from app.config import configuracion
 from app.core.database import obtener_cliente
@@ -446,6 +449,15 @@ async def ac_command_from_prediction(prediccion_id: int):
 @enrutador.post("/reports/energy")
 async def reporte_energia(carga: dict | None = None):
     cliente = obtener_cliente()
+
+    # Obtener nombres de salones por pabellon
+    salas_resp = cliente.table("rooms").select("nombre,pabellon").execute()
+    pabellon_a_nombre = {
+        r["pabellon"]: r["nombre"]
+        for r in (salas_resp.data or [])
+        if r.get("pabellon") and r.get("nombre")
+    }
+
     respuesta = (
         cliente.table("registros")
         .select("*")
@@ -468,17 +480,38 @@ async def reporte_energia(carga: dict | None = None):
             if len(energias) >= 2
             else (sum(potencias) / len(potencias) / 1000 if potencias else 0)
         )
+        nombre_salon = pabellon_a_nombre.get(pabellon, pabellon)
         rooms.append({
-            "room_name": aire,
+            "room_name": f"{nombre_salon} — {aire}",
+            "salon": nombre_salon,
+            "aire": aire,
             "pavilion": pabellon,
-            "total_energy_kwh": energia,
-            "total_cost": energia * TARIFA_KWH,
+            "total_energy_kwh": round(energia, 6),
+            "total_cost": round(energia * TARIFA_KWH, 6),
             "savings_pct": None,
             "savings_cost": 0,
             "recommendations": [],
         })
 
-    return {"type": "energy", "rooms": rooms, "generated_at": datetime.now(timezone.utc).isoformat()}
+    generado_en = datetime.now(timezone.utc).isoformat()
+
+    if carga and carga.get("format") == "csv":
+        output = io.StringIO()
+        writer = csv.DictWriter(
+            output,
+            fieldnames=["salon", "aire", "total_energy_kwh", "total_cost"],
+            extrasaction="ignore",
+        )
+        writer.writeheader()
+        writer.writerows(rooms)
+        output.seek(0)
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=reporte_atmos.csv"},
+        )
+
+    return {"type": "energy", "rooms": rooms, "generated_at": generado_en}
 
 
 @enrutador.get("/reports/energy")

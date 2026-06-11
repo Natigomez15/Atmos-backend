@@ -1,12 +1,14 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+
 from app.models.schemas import SalaCrear, SalaActualizar, SalaRespuesta
 from app.core.database import obtener_cliente
+from app.core.security import requerir_admin
 
 enrutador = APIRouter(prefix="/salas", tags=["salas"])
 
 
 @enrutador.post("/", response_model=SalaRespuesta, status_code=201)
-async def crear_sala(sala: SalaCrear):
+async def crear_sala(sala: SalaCrear, _=Depends(requerir_admin)):
     cliente = obtener_cliente()
     try:
         respuesta = cliente.table("rooms").insert(sala.model_dump()).execute()
@@ -36,7 +38,7 @@ async def obtener_sala(sala_id: str):
 
 
 @enrutador.patch("/{sala_id}", response_model=SalaRespuesta)
-async def actualizar_sala(sala_id: str, cambios: SalaActualizar):
+async def actualizar_sala(sala_id: str, cambios: SalaActualizar, _=Depends(requerir_admin)):
     cliente = obtener_cliente()
     datos_a_actualizar = {
         campo: valor

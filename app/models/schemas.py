@@ -48,6 +48,7 @@ class SalaCrear(BaseModel):
     piso: Optional[int] = None
     marca_ac: Optional[str] = None
     modelo_ac: Optional[str] = None
+    aires: Optional[List[str]] = Field(default_factory=list)
 
 
 class SalaActualizar(BaseModel):
@@ -58,6 +59,7 @@ class SalaActualizar(BaseModel):
     piso: Optional[int] = None
     marca_ac: Optional[str] = None
     modelo_ac: Optional[str] = None
+    aires: Optional[List[str]] = None
 
 
 class SalaRespuesta(SalaCrear):

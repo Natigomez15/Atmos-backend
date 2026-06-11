@@ -48,7 +48,21 @@ def _mapear_sala(sala: dict) -> dict:
         "pavilion": sala.get("pabellon") or sala.get("edificio"),
         "floor": sala.get("piso"),
         "capacity": sala.get("capacidad"),
+        "aires": sala.get("aires") or [],
     }
+
+
+def _resolver_pabellon_y_aire(sala: dict, aire_param: Optional[str] = None) -> tuple[str | None, str | None]:
+    pabellon = sala.get("pabellon") or sala.get("edificio")
+    aires = sala.get("aires") or []
+    if aire_param:
+        aire = aire_param
+    elif aires:
+        aire = aires[0]
+    else:
+        # legado: nombre del salón era el nombre del aire
+        aire = sala.get("nombre")
+    return pabellon, aire
 
 
 def _mapear_alerta(alerta: dict) -> dict:
@@ -146,7 +160,7 @@ async def actualizar_room(sala_id: UUID, cambios: SalaActualizar):
 
 
 @enrutador.get("/readings/latest/{sala_id}")
-async def obtener_reading_reciente(sala_id: UUID):
+async def obtener_reading_reciente(sala_id: UUID, aire: Optional[str] = None):
     cliente = obtener_cliente()
     respuesta = (
         cliente.table("registros")
@@ -161,21 +175,20 @@ async def obtener_reading_reciente(sala_id: UUID):
 
     sala_respuesta = (
         cliente.table("rooms")
-        .select("nombre,pabellon,edificio")
+        .select("nombre,pabellon,edificio,aires")
         .eq("id", str(sala_id))
         .limit(1)
         .execute()
     )
     if sala_respuesta.data:
         sala = sala_respuesta.data[0]
-        pabellon = sala.get("pabellon") or sala.get("edificio")
-        aire = sala.get("nombre")
-        if pabellon and aire:
+        pabellon, aire_a_usar = _resolver_pabellon_y_aire(sala, aire)
+        if pabellon and aire_a_usar:
             respuesta = (
                 cliente.table("registros")
                 .select("*")
                 .eq("pabellon", pabellon)
-                .eq("aire", aire)
+                .eq("aire", aire_a_usar)
                 .order("fecha_sync", desc=True)
                 .limit(1)
                 .execute()
@@ -190,6 +203,7 @@ async def obtener_reading_reciente(sala_id: UUID):
 @enrutador.get("/readings")
 async def listar_readings(
     room_id: UUID,
+    aire: Optional[str] = None,
     start: Optional[datetime] = None,
     end: Optional[datetime] = None,
     limit: Annotated[int, Query(ge=1, le=2000)] = 500,
@@ -212,21 +226,20 @@ async def listar_readings(
 
     sala_respuesta = (
         cliente.table("rooms")
-        .select("nombre,pabellon,edificio")
+        .select("nombre,pabellon,edificio,aires")
         .eq("id", str(room_id))
         .limit(1)
         .execute()
     )
     if sala_respuesta.data:
         sala = sala_respuesta.data[0]
-        pabellon = sala.get("pabellon") or sala.get("edificio")
-        aire = sala.get("nombre")
-        if pabellon and aire:
+        pabellon, aire_a_usar = _resolver_pabellon_y_aire(sala, aire)
+        if pabellon and aire_a_usar:
             consulta = (
                 cliente.table("registros")
                 .select("*")
                 .eq("pabellon", pabellon)
-                .eq("aire", aire)
+                .eq("aire", aire_a_usar)
                 .order("fecha_sync", desc=False)
                 .limit(limit)
             )
@@ -476,8 +489,7 @@ async def reporte_energia_get():
 @enrutador.post("/reports/room/{sala_id}")
 async def reporte_room(sala_id: UUID, carga: dict | None = None):
     room = await obtener_room(sala_id)
-    pabellon = room.get("pabellon") or room.get("pavilion") or room.get("edificio")
-    aire = room.get("nombre") or room.get("name")
+    pabellon, aire = _resolver_pabellon_y_aire(room)
     cliente = obtener_cliente()
     respuesta = (
         cliente.table("registros")
@@ -494,8 +506,7 @@ async def reporte_room(sala_id: UUID, carga: dict | None = None):
 @enrutador.get("/reports/compare")
 async def comparar_room(room_id: UUID, period_days: int = 30):
     room = await obtener_room(room_id)
-    pabellon = room.get("pabellon") or room.get("pavilion") or room.get("edificio")
-    aire = room.get("nombre") or room.get("name")
+    pabellon, aire = _resolver_pabellon_y_aire(room)
     cliente = obtener_cliente()
     respuesta = (
         cliente.table("registros")

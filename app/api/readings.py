@@ -167,6 +167,19 @@ async def disparar_agregacion(
 # Registros Firebase (sincronización legacy)
 # ---------------------------------------------------------------------------
 
+@enrutador.get("/registros/aires")
+async def obtener_aires_de_pabellon(pabellon: str):
+    cliente = obtener_cliente()
+    respuesta = (
+        cliente.table("registros")
+        .select("aire")
+        .eq("pabellon", pabellon)
+        .execute()
+    )
+    aires = sorted({r["aire"] for r in respuesta.data if r.get("aire")})
+    return aires
+
+
 @enrutador.get("/registros", response_model=list[RegistroRespuesta])
 async def listar_registros(
     pabellon: str | None = None,

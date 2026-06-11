@@ -1,4 +1,9 @@
 .env
 serviceAccountKey.json
 .venv/
+.venv311/
 __pycache__/
+.coverage
+logs/
+private_key.pem
+public_key.pem

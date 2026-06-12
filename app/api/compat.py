@@ -315,6 +315,8 @@ async def resumen_alerts():
                 "temperatura_fuera_rango",
                 "humedad_alta",
                 "humedad_invalida",
+                "control_ir_inactivo",
+                "aire_sin_datos",
             }
         },
     }

@@ -89,6 +89,8 @@ async def resumen_alertas(request: Request):
         "temperatura_fuera_rango": 0,
         "humedad_alta": 0,
         "humedad_invalida": 0,
+        "control_ir_inactivo": 0,
+        "aire_sin_datos": 0,
     }
 
     for fila in filas:

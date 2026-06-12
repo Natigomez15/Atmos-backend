@@ -203,12 +203,13 @@ def test_verificar_alertas_atmos_crea_alerta_control_ir_inactivo(
         "humedad": 50.0,
         "control_ir_activo": False,
         "ultima_accion_ejecutada": "",
-        "fecha_sync": "2025-01-01T00:00:00+00:00",
+        "fecha_sync": datetime.now(timezone.utc).isoformat(),
     }
     mock_cliente.execute.side_effect = [
         MagicMock(data=[{"id": SALA_ID, "nombre": "Aire_1", "pabellon": "robotica"}]),
         MagicMock(data=[]),          # sensor_datos_invalidos activa
         MagicMock(data=[registro]),  # ultimo registro ATMOS
+        MagicMock(data=[]),          # aire_sin_datos activa
         MagicMock(data=[]),          # control_ir_inactivo activa
         MagicMock(data=[alerta_ir]), # insertar alerta
         MagicMock(data=[]),          # temperatura_alta activa
@@ -224,6 +225,62 @@ def test_verificar_alertas_atmos_crea_alerta_control_ir_inactivo(
 
     assert resultado["creadas"] == 1
     assert "control_ir_inactivo" in resultado["tipos"]
+    mock_notificar.assert_called_once()
+
+
+@patch("app.services.alert_service.notificar_alerta_push")
+@patch("app.services.alert_service.gestor")
+@patch("app.services.alert_service.obtener_cliente")
+def test_verificar_alertas_atmos_crea_alerta_aire_sin_datos(
+    mock_obtener, mock_gestor, mock_notificar
+):
+    """Crea alerta push cuando un aire lleva mas de 5 minutos sin datos."""
+    mock_gestor.transmitir_a_todos = AsyncMock()
+    mock_cliente = _crear_mock_cliente()
+    mock_obtener.return_value = mock_cliente
+
+    hace_6_min = (datetime.now(timezone.utc) - timedelta(minutes=6)).isoformat()
+    alerta = {
+        "id": 5,
+        "tipo_alerta": "aire_sin_datos",
+        "severidad": "high",
+        "sala_id": SALA_ID,
+        "nodo_id": None,
+        "mensaje": "Aire_2 lleva 6.0 minutos sin enviar datos.",
+        "detalle": {"minutos_sin_datos": 6},
+        "esta_resuelta": False,
+        "creado_en": "2025-01-01T00:00:00+00:00",
+        "resuelto_en": None,
+    }
+    registro = {
+        "firebase_key": "robotica_Aire_2_abc",
+        "pabellon": "robotica",
+        "aire": "Aire_2",
+        "temperatura_ambiente": 24.0,
+        "humedad": 50.0,
+        "control_ir_activo": True,
+        "fecha_sync": hace_6_min,
+    }
+    mock_cliente.execute.side_effect = [
+        MagicMock(data=[{"id": SALA_ID, "nombre": "Aire_2", "pabellon": "robotica"}]),
+        MagicMock(data=[]),          # sensor_datos_invalidos activa
+        MagicMock(data=[registro]),  # ultimo registro ATMOS
+        MagicMock(data=[]),          # aire_sin_datos activa
+        MagicMock(data=[alerta]),    # insertar alerta
+        MagicMock(data=[]),          # control_ir_inactivo activa
+        MagicMock(data=[]),          # temperatura_alta activa
+        MagicMock(data=[]),          # temperatura_fuera_rango activa
+        MagicMock(data=[]),          # humedad_alta activa
+        MagicMock(data=[]),          # humedad_invalida activa
+    ]
+
+    resultado = ServicioAlertas().verificar_alertas_atmos(
+        pabellon="robotica",
+        aire="Aire_2",
+    )
+
+    assert resultado["creadas"] == 1
+    assert "aire_sin_datos" in resultado["tipos"]
     mock_notificar.assert_called_once()
 
 

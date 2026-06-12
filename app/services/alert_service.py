@@ -15,6 +15,18 @@ def _iso(dt: datetime) -> str:
     return dt.isoformat()
 
 
+MINUTOS_SIN_DATOS_AIRE = 5
+
+
+def _desde_iso(valor: str | None) -> datetime | None:
+    if not valor:
+        return None
+    try:
+        return datetime.fromisoformat(str(valor).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 class ServicioAlertas:
 
     # -----------------------------------------------------------------------
@@ -99,6 +111,7 @@ class ServicioAlertas:
             "humedad_alta",
             "humedad_invalida",
             "control_ir_inactivo",
+            "aire_sin_datos",
         }:
             return
 
@@ -313,6 +326,44 @@ class ServicioAlertas:
         temperatura = _numero(registro.get("temperatura_ambiente"))
         humedad = _numero(registro.get("humedad"))
         fecha_sync = registro.get("fecha_sync")
+        fecha_sync_dt = _desde_iso(fecha_sync)
+        minutos_sin_datos = None
+
+        if fecha_sync_dt:
+            minutos_sin_datos = round(
+                (_ahora() - fecha_sync_dt.astimezone(timezone.utc)).total_seconds() / 60,
+                2,
+            )
+            if minutos_sin_datos >= MINUTOS_SIN_DATOS_AIRE:
+                detalle = {
+                    "minutos_sin_datos": minutos_sin_datos,
+                    "umbral_minutos": MINUTOS_SIN_DATOS_AIRE,
+                    "pabellon": pabellon,
+                    "aire": aire,
+                    "fecha_sync": fecha_sync,
+                    "firebase_key": registro.get("firebase_key"),
+                    "fuente": "registros",
+                }
+                estado, _alerta = self._crear_o_actualizar_alerta_atmos(
+                    cliente,
+                    "aire_sin_datos",
+                    "high",
+                    f"{aire} lleva {minutos_sin_datos:.1f} minutos sin enviar datos.",
+                    detalle,
+                    sala_id,
+                )
+                creadas += 1 if estado == "creada" else 0
+                actualizadas += 1 if estado == "actualizada" else 0
+                tipos.append("aire_sin_datos")
+            else:
+                resueltas += self._resolver_alertas_atmos(
+                    cliente,
+                    ["aire_sin_datos"],
+                    sala_id,
+                    pabellon,
+                    aire,
+                )
+
         control_ir_activo = registro.get("control_ir_activo")
 
         if control_ir_activo is False:

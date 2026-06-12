@@ -464,6 +464,21 @@ def obtener_ultimo_registro_supabase_rest(pabellon: str, aire: str) -> dict | No
     return datos[0] if isinstance(datos, list) and datos else None
 
 
+def obtener_registro_por_firebase_key(firebase_key: str) -> dict | None:
+    cliente = obtener_cliente()
+    try:
+        respuesta = (
+            cliente.table("registros")
+            .select("*")
+            .eq("firebase_key", firebase_key)
+            .limit(1)
+            .execute()
+        )
+        return respuesta.data[0] if respuesta.data else None
+    except Exception:
+        return None
+
+
 def sincronizar_firebase_supabase(
     pabellon_objetivo: str | None = "robotica",
     aire_objetivo: str | None = "Aire_1",
@@ -506,6 +521,23 @@ def sincronizar_firebase_supabase(
                 "etapas": etapas,
                 "duracion_total_ms": round((time.monotonic() - inicio_total) * 1000, 2),
             }
+
+        llave_completa = f"{pabellon_objetivo}_{aire_objetivo}_{seleccion['firebase_key']}"
+        if obtener_registro_por_firebase_key(llave_completa):
+            return {
+                "sincronizados": 0,
+                "errores": 0,
+                "detalles_errores": [],
+                "lectura_valida": True,
+                "lecturas_invalidas_ignoradas": seleccion["lecturas_invalidas_ignoradas"],
+                "firebase_key_usado": llave_completa,
+                "diagnostico": seleccion["diagnostico"],
+                "advertencias": seleccion["advertencias"],
+                "mensaje": "La lectura ya estaba sincronizada en Supabase.",
+                "etapas": etapas,
+                "duracion_total_ms": round((time.monotonic() - inicio_total) * 1000, 2),
+            }
+
         datos = {
             pabellon_objetivo: {
                 aire_objetivo: {"lecturas": lecturas or {}}
@@ -523,6 +555,7 @@ def sincronizar_firebase_supabase(
     sincronizados = 0
     errores = 0
     detalles_errores: list[str] = []
+    duplicados_ignorados = 0
 
     for pabellon, aires in datos.items():
         if not isinstance(aires, dict):
@@ -543,15 +576,17 @@ def sincronizar_firebase_supabase(
 
                 sala_id = _a_uuid(valor.get("sala_id"))
                 nodo_id = _a_uuid(valor.get("nodo_id"))
-                registro_anterior = obtener_ultimo_registro_supabase_rest(pabellon, aire)
                 firebase_key_unica = f"{pabellon}_{aire}_{firebase_key}"
-                if registro_anterior and registro_anterior.get("firebase_key") == firebase_key_unica:
-                    valor = {**valor}
-                    if valor.get("potencia_w") is None and valor.get("power_w") is None:
-                        valor["potencia_w"] = registro_anterior.get("potencia_w")
-                    if valor.get("energia_kwh") is None and valor.get("energy_kwh") is None:
-                        valor["energia_kwh"] = registro_anterior.get("energia_kwh")
-                    registro_anterior = None
+
+                if obtener_registro_por_firebase_key(firebase_key_unica):
+                    duplicados_ignorados += 1
+                    etapas.append({
+                        "paso": "skip_duplicado",
+                        "firebase_key": firebase_key_unica,
+                    })
+                    continue
+
+                registro_anterior = obtener_ultimo_registro_supabase_rest(pabellon, aire)
                 registro = preparar_registro_supabase(
                     pabellon=pabellon,
                     aire=aire,
@@ -579,6 +614,7 @@ def sincronizar_firebase_supabase(
         "sincronizados": sincronizados,
         "errores": errores,
         "detalles_errores": detalles_errores[:10],
+        "duplicados_ignorados": duplicados_ignorados,
         "lectura_valida": True if metadata_seleccion else None,
         "lecturas_invalidas_ignoradas": (
             metadata_seleccion["lecturas_invalidas_ignoradas"]

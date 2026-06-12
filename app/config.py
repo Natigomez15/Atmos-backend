@@ -17,6 +17,8 @@ class Configuracion(BaseSettings):
     FIREBASE_AUTH_DOMAIN: str = ""
     FIREBASE_DATABASE_URL: str = ""
     FIREBASE_STORAGE_BUCKET: str = ""
+    FIREBASE_SYNC_AUTOSTART: bool = False
+    FIREBASE_SYNC_INTERVAL_SECONDS: int = 10
 
     # VAPID — notificaciones push
     vapid_clave_privada: str = ""

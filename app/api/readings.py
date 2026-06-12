@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, Query, Header, Request
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from uuid import UUID
 from typing import Annotated, Optional
 from pydantic import Field
@@ -14,8 +14,12 @@ from app.core.database import obtener_cliente
 from app.core.logger import log
 from app.core.websocket_manager import gestor
 from app.services.aggregation import agregar_lecturas, ServicioAgregacion
-from app.services.sincronizador_firebase import sincronizar_firebase_supabase
-from app.services.sincronizador_firebase import leer_ultimas_lecturas_firebase_rest
+from app.services.sincronizador_firebase import (
+    sincronizar_firebase_supabase,
+    leer_ultimas_lecturas_firebase_rest,
+    leer_ultima_lectura_valida_firebase_rest,
+    preparar_registro_supabase,
+)
 from app.config import configuracion
 from app.core.limiter import limitador
 
@@ -149,6 +153,40 @@ async def ultima_lectura_sala(sala_id: UUID):
     return respuesta.data[0]
 
 
+def _es_registro_antiguo(fecha_sync: str | None, umbral_segundos: int = 60) -> bool:
+    if not fecha_sync:
+        return True
+    try:
+        registrado_en = datetime.fromisoformat(str(fecha_sync).replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    return datetime.now(timezone.utc) - registrado_en > timedelta(seconds=umbral_segundos)
+
+
+def _obtener_lectura_firebase_directa(pabellon: str, aire: str, sala_id: str | None = None, nodo_id: str | None = None) -> dict | None:
+    seleccion = leer_ultima_lectura_valida_firebase_rest(
+        pabellon=pabellon,
+        aire=aire,
+        limite=50,
+    )
+    if not seleccion.get("valida") or not seleccion.get("lectura"):
+        return None
+
+    firebase_key = seleccion.get("firebase_key") or "directo"
+    try:
+        return preparar_registro_supabase(
+            pabellon=pabellon,
+            aire=aire,
+            firebase_key=firebase_key,
+            valor=seleccion["lectura"],
+            sala_id=sala_id,
+            nodo_id=nodo_id,
+            registro_anterior=None,
+        )
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Agregación horaria (disparada por cron-job.org)
 # ---------------------------------------------------------------------------
@@ -226,10 +264,32 @@ async def obtener_registro_reciente(
         .order("fecha_sync", desc=True)
         .limit(1)
     )
+
     if sala_id:
         respuesta = consulta_base.eq("sala_id", str(sala_id)).execute()
         if respuesta.data:
-            return respuesta.data[0]
+            registro = respuesta.data[0]
+            if _es_registro_antiguo(registro.get("fecha_sync")):
+                sala_respuesta = (
+                    cliente.table("rooms")
+                    .select("nombre,pabellon,edificio")
+                    .eq("id", str(sala_id))
+                    .limit(1)
+                    .execute()
+                )
+                if sala_respuesta.data:
+                    sala = sala_respuesta.data[0]
+                    pabellon_sala = sala.get("pabellon") or sala.get("edificio")
+                    aire_sala = sala.get("nombre")
+                    if pabellon_sala and aire_sala:
+                        lectura_firebase = _obtener_lectura_firebase_directa(
+                            pabellon_sala,
+                            aire_sala,
+                            sala_id=str(sala_id),
+                        )
+                        if lectura_firebase:
+                            return lectura_firebase
+            return registro
 
         sala_respuesta = (
             cliente.table("rooms")
@@ -243,21 +303,26 @@ async def obtener_registro_reciente(
             pabellon_sala = sala.get("pabellon") or sala.get("edificio")
             aire_sala = sala.get("nombre")
             if pabellon_sala and aire_sala:
-                respuesta = (
-                    cliente.table("registros")
-                    .select("*")
-                    .eq("pabellon", pabellon_sala)
-                    .eq("aire", aire_sala)
-                    .order("fecha_sync", desc=True)
-                    .limit(1)
-                    .execute()
+                lectura_firebase = _obtener_lectura_firebase_directa(
+                    pabellon_sala,
+                    aire_sala,
+                    sala_id=str(sala_id),
                 )
-                if respuesta.data:
-                    return {**respuesta.data[0], "sala_id": str(sala_id)}
+                if lectura_firebase:
+                    return lectura_firebase
     else:
         respuesta = consulta_base.eq("pabellon", pabellon).eq("aire", aire).execute()
         if respuesta.data:
-            return respuesta.data[0]
+            registro = respuesta.data[0]
+            if _es_registro_antiguo(registro.get("fecha_sync")):
+                lectura_firebase = _obtener_lectura_firebase_directa(pabellon, aire)
+                if lectura_firebase:
+                    return lectura_firebase
+            return registro
+
+        lectura_firebase = _obtener_lectura_firebase_directa(pabellon, aire)
+        if lectura_firebase:
+            return lectura_firebase
 
     raise HTTPException(status_code=404, detail="No hay registros sincronizados")
 

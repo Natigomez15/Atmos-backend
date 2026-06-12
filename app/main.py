@@ -8,10 +8,12 @@ from slowapi.errors import RateLimitExceeded
 from slowapi import _rate_limit_exceeded_handler
 
 from app.api import rooms, nodes, readings, ml, ac_commands, alerts, websockets, notificaciones, compat, atmos, ajustes
+from app.config import configuracion
 from app.core.database import obtener_cliente
 from app.core.limiter import limitador
 from app.core.logger import log
 from app.core.websocket_manager import gestor
+from app.services.sincronizador_firebase import sincronizar_firebase_supabase
 
 app = FastAPI(title="ATMOS API")
 aplicacion = app
@@ -50,6 +52,33 @@ async def iniciar_heartbeat():
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
     asyncio.create_task(bucle_heartbeat())
+
+
+@app.on_event("startup")
+async def iniciar_sincronizacion_firebase():
+    if not configuracion.FIREBASE_SYNC_AUTOSTART:
+        return
+
+    async def bucle_sincronizacion():
+        while True:
+            try:
+                resultado = await asyncio.to_thread(
+                    sincronizar_firebase_supabase,
+                    None,
+                    None,
+                )
+                log.info({
+                    "evento": "sincronizacion_firebase_periodica",
+                    "resultado": resultado,
+                })
+            except Exception as error:
+                log.error({
+                    "evento": "sincronizacion_firebase_error",
+                    "error": str(error),
+                })
+            await asyncio.sleep(configuracion.FIREBASE_SYNC_INTERVAL_SECONDS)
+
+    asyncio.create_task(bucle_sincronizacion())
 
 
 @app.middleware("http")

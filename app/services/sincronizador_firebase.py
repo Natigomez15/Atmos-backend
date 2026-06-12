@@ -1,7 +1,7 @@
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from uuid import UUID
 
 import httpx
@@ -92,17 +92,17 @@ def validar_lectura_firebase(valor: dict) -> tuple[bool, list[str]]:
 
     if temperatura_ambiente is None:
         razones.append("temperatura_ambiente ausente")
-    elif temperatura_ambiente == 0:
-        razones.append("temperatura_ambiente en 0")
-    elif temperatura_ambiente < 10 or temperatura_ambiente > 45:
-        razones.append("temperatura_ambiente fuera de rango")
+    # elif temperatura_ambiente == 0:
+    #     razones.append("temperatura_ambiente en 0")
+    # elif temperatura_ambiente < 10 or temperatura_ambiente > 45:
+    #     razones.append("temperatura_ambiente fuera de rango")
 
     if humedad is None:
         razones.append("humedad ausente")
-    elif humedad <= 0:
-        razones.append("humedad en 0 o negativa")
-    elif humedad > 100:
-        razones.append("humedad fuera de rango")
+    # elif humedad <= 0:
+    #     razones.append("humedad en 0 o negativa")
+    # elif humedad > 100:
+    #     razones.append("humedad fuera de rango")
 
     return len(razones) == 0, razones
 
@@ -379,7 +379,10 @@ def leer_ultimas_lecturas_firebase_rest(
     limite: int = 1,
 ) -> dict:
     database_url = configuracion.FIREBASE_DATABASE_URL.rstrip("/")
-    ruta = f"Atmos/registro/{pabellon}/{aire}/lecturas.json"
+    ruta = (
+        f"Atmos/registro/{quote(str(pabellon).strip(), safe='')}/"
+        f"{quote(str(aire).strip(), safe='')}/lecturas.json"
+    )
     parametros = urlencode({
         "orderBy": '"$key"',
         "limitToLast": limite,

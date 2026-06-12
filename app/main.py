@@ -13,6 +13,7 @@ from app.core.database import obtener_cliente
 from app.core.limiter import limitador
 from app.core.logger import log
 from app.core.websocket_manager import gestor
+from app.services.alert_service import ServicioAlertas
 from app.services.sincronizador_firebase import sincronizar_firebase_supabase
 
 app = FastAPI(title="ATMOS API")
@@ -70,6 +71,13 @@ async def iniciar_sincronizacion_firebase():
                 log.info({
                     "evento": "sincronizacion_firebase_periodica",
                     "resultado": resultado,
+                })
+                alertas = await asyncio.to_thread(
+                    ServicioAlertas().verificar_alertas_registros_atmos
+                )
+                log.info({
+                    "evento": "alertas_atmos_periodicas",
+                    "resultado": alertas,
                 })
             except Exception as error:
                 log.error({

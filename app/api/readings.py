@@ -14,6 +14,7 @@ from app.core.database import obtener_cliente
 from app.core.logger import log
 from app.core.websocket_manager import gestor
 from app.services.aggregation import agregar_lecturas, ServicioAgregacion
+from app.services.alert_service import ServicioAlertas
 from app.services.sincronizador_firebase import (
     sincronizar_firebase_supabase,
     leer_ultimas_lecturas_firebase_rest,
@@ -354,10 +355,15 @@ def sincronizar_registros_firebase(
         raise HTTPException(status_code=401, detail="Token ATMOS inválido")
 
     try:
-        return sincronizar_firebase_supabase(
+        resultado = sincronizar_firebase_supabase(
             pabellon_objetivo=pabellon,
             aire_objetivo=aire,
         )
+        resultado["alertas"] = ServicioAlertas().verificar_alertas_registros_atmos(
+            pabellon=pabellon,
+            aire=aire,
+        )
+        return resultado
     except Exception as error:
         raise HTTPException(
             status_code=500,
@@ -403,10 +409,15 @@ def sincronizar_registros_firebase_rapido(
         raise HTTPException(status_code=401, detail="Token ATMOS invalido")
 
     try:
-        return sincronizar_firebase_supabase(
+        resultado = sincronizar_firebase_supabase(
             pabellon_objetivo=pabellon,
             aire_objetivo=aire,
         )
+        resultado["alertas"] = ServicioAlertas().verificar_alertas_registros_atmos(
+            pabellon=pabellon,
+            aire=aire,
+        )
+        return resultado
     except Exception as error:
         raise HTTPException(
             status_code=500,

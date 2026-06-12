@@ -17,7 +17,7 @@ def _crear_mock_cliente() -> MagicMock:
     for metodo in (
         "table", "select", "insert", "update", "upsert", "delete",
         "eq", "neq", "gt", "gte", "lt", "lte", "is_", "in_",
-        "order", "limit", "single",
+        "order", "limit", "single", "or_",
     ):
         getattr(mock, metodo).return_value = mock
     mock.execute.return_value = MagicMock(data=[])
@@ -170,6 +170,61 @@ def test_verificar_temperatura_estancada_crea_alerta(mock_obtener, mock_gestor):
 
     assert len(resultado) == 1
     assert resultado[0]["tipo_alerta"] == "temperature_stuck"
+
+
+@patch("app.services.alert_service.notificar_alerta_push")
+@patch("app.services.alert_service.gestor")
+@patch("app.services.alert_service.obtener_cliente")
+def test_verificar_alertas_atmos_crea_alerta_control_ir_inactivo(
+    mock_obtener, mock_gestor, mock_notificar
+):
+    """Crea alerta push cuando el control IR deja de estar activo."""
+    mock_gestor.transmitir_a_todos = AsyncMock()
+    mock_cliente = _crear_mock_cliente()
+    mock_obtener.return_value = mock_cliente
+
+    alerta_ir = {
+        "id": 4,
+        "tipo_alerta": "control_ir_inactivo",
+        "severidad": "high",
+        "sala_id": SALA_ID,
+        "nodo_id": None,
+        "mensaje": "Se dejo de enviar senal IR al Aire_1.",
+        "detalle": {"control_ir_activo": False},
+        "esta_resuelta": False,
+        "creado_en": "2025-01-01T00:00:00+00:00",
+        "resuelto_en": None,
+    }
+    registro = {
+        "firebase_key": "robotica_Aire_1_abc",
+        "pabellon": "robotica",
+        "aire": "Aire_1",
+        "temperatura_ambiente": 24.0,
+        "humedad": 50.0,
+        "control_ir_activo": False,
+        "ultima_accion_ejecutada": "",
+        "fecha_sync": "2025-01-01T00:00:00+00:00",
+    }
+    mock_cliente.execute.side_effect = [
+        MagicMock(data=[{"id": SALA_ID, "nombre": "Aire_1", "pabellon": "robotica"}]),
+        MagicMock(data=[]),          # sensor_datos_invalidos activa
+        MagicMock(data=[registro]),  # ultimo registro ATMOS
+        MagicMock(data=[]),          # control_ir_inactivo activa
+        MagicMock(data=[alerta_ir]), # insertar alerta
+        MagicMock(data=[]),          # temperatura_alta activa
+        MagicMock(data=[]),          # temperatura_fuera_rango activa
+        MagicMock(data=[]),          # humedad_alta activa
+        MagicMock(data=[]),          # humedad_invalida activa
+    ]
+
+    resultado = ServicioAlertas().verificar_alertas_atmos(
+        pabellon="robotica",
+        aire="Aire_1",
+    )
+
+    assert resultado["creadas"] == 1
+    assert "control_ir_inactivo" in resultado["tipos"]
+    mock_notificar.assert_called_once()
 
 
 @patch("app.services.alert_service.gestor")

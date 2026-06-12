@@ -20,6 +20,7 @@ ROLES_POR_TIPO_ALERTA: dict[str, list[str]] = {
     "temperatura_fuera_rango": ["admin", "mantenimiento"],
     "humedad_alta": ["admin", "mantenimiento"],
     "humedad_invalida": ["admin", "mantenimiento"],
+    "control_ir_inactivo": ["admin", "mantenimiento"],
 }
 
 MENSAJES_PUSH_ATMOS: dict[str, dict[str, str]] = {
@@ -45,6 +46,10 @@ MENSAJES_PUSH_ATMOS: dict[str, dict[str, str]] = {
     "humedad_invalida": {
         "titulo": "ATMOS: humedad invalida",
         "cuerpo": "Se detecto una lectura de humedad invalida.",
+    },
+    "control_ir_inactivo": {
+        "titulo": "ATMOS: senal IR detenida",
+        "cuerpo": "El ESP32 dejo de enviar senal de control al aire acondicionado.",
     },
 }
 

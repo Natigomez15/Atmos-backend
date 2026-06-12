@@ -98,6 +98,7 @@ class ServicioAlertas:
             "temperatura_fuera_rango",
             "humedad_alta",
             "humedad_invalida",
+            "control_ir_inactivo",
         }:
             return
 
@@ -312,6 +313,37 @@ class ServicioAlertas:
         temperatura = _numero(registro.get("temperatura_ambiente"))
         humedad = _numero(registro.get("humedad"))
         fecha_sync = registro.get("fecha_sync")
+        control_ir_activo = registro.get("control_ir_activo")
+
+        if control_ir_activo is False:
+            detalle = {
+                "control_ir_activo": control_ir_activo,
+                "ultima_accion_ejecutada": registro.get("ultima_accion_ejecutada"),
+                "pabellon": pabellon,
+                "aire": aire,
+                "fecha_sync": fecha_sync,
+                "firebase_key": registro.get("firebase_key"),
+                "fuente": "registros",
+            }
+            estado, _alerta = self._crear_o_actualizar_alerta_atmos(
+                cliente,
+                "control_ir_inactivo",
+                "high",
+                f"Se dejo de enviar senal IR al {aire}.",
+                detalle,
+                sala_id,
+            )
+            creadas += 1 if estado == "creada" else 0
+            actualizadas += 1 if estado == "actualizada" else 0
+            tipos.append("control_ir_inactivo")
+        elif control_ir_activo is True:
+            resueltas += self._resolver_alertas_atmos(
+                cliente,
+                ["control_ir_inactivo"],
+                sala_id,
+                pabellon,
+                aire,
+            )
 
         if temperatura is not None and temperatura != 0 and temperatura > 32:
             detalle = {
@@ -417,6 +449,50 @@ class ServicioAlertas:
             "tipos": sorted(set(tipos)),
             "errores": errores,
             "fuente": "registros_atmos_diagnostico",
+        }
+
+    def verificar_alertas_registros_atmos(
+        self,
+        pabellon: str | None = None,
+        aire: str | None = None,
+    ) -> dict:
+        cliente = obtener_cliente()
+        if pabellon and aire:
+            pares = [(pabellon, aire)]
+        else:
+            consulta = cliente.table("registros").select("pabellon,aire")
+            if pabellon:
+                consulta = consulta.eq("pabellon", pabellon)
+            if aire:
+                consulta = consulta.eq("aire", aire)
+            respuesta = consulta.execute()
+            pares = sorted({
+                (fila.get("pabellon"), fila.get("aire"))
+                for fila in (respuesta.data or [])
+                if fila.get("pabellon") and fila.get("aire")
+            })
+
+        resultados = []
+        for pabellon_item, aire_item in pares:
+            resultados.append(
+                self.verificar_alertas_atmos(
+                    pabellon=pabellon_item,
+                    aire=aire_item,
+                )
+            )
+
+        return {
+            "verificadas": True,
+            "pares_revisados": len(pares),
+            "resultados": resultados,
+            "creadas": sum(r.get("creadas", 0) for r in resultados),
+            "actualizadas": sum(r.get("actualizadas", 0) for r in resultados),
+            "resueltas": sum(r.get("resueltas", 0) for r in resultados),
+            "tipos": sorted({
+                tipo
+                for resultado in resultados
+                for tipo in resultado.get("tipos", [])
+            }),
         }
 
     def _resolver_alertas(self, cliente, ids: list[int]) -> None:

@@ -460,13 +460,13 @@ async def reporte_energia(carga: dict | None = None):
         if r.get("pabellon") and r.get("nombre")
     }
 
-    respuesta = (
-        cliente.table("registros")
-        .select("*")
-        .order("fecha_sync", desc=True)
-        .limit(1000)
-        .execute()
-    )
+    query = cliente.table("registros").select("*")
+    period = (carga or {}).get("period", {})
+    if period.get("start"):
+        query = query.gte("fecha_sync", period["start"])
+    if period.get("end"):
+        query = query.lte("fecha_sync", period["end"])
+    respuesta = query.order("fecha_sync", desc=True).limit(5000).execute()
     registros = respuesta.data or []
     por_salon: dict[tuple[str, str], list[dict]] = {}
     for registro in registros:
@@ -501,11 +501,25 @@ async def reporte_energia(carga: dict | None = None):
         output = io.StringIO()
         writer = csv.DictWriter(
             output,
-            fieldnames=["salon", "aire", "total_energy_kwh", "total_cost"],
+            fieldnames=["fecha", "salon", "aire", "temperatura_c", "humedad_pct", "potencia_w", "energia_kwh", "ac_encendido", "presencia"],
             extrasaction="ignore",
         )
         writer.writeheader()
-        writer.writerows(rooms)
+        for registro in registros:
+            pabellon = registro.get("pabellon") or ""
+            aire = registro.get("aire") or ""
+            nombre_salon = pabellon_a_nombre.get(pabellon, pabellon)
+            writer.writerow({
+                "fecha":          registro.get("fecha_sync", ""),
+                "salon":          nombre_salon,
+                "aire":           aire,
+                "temperatura_c":  registro.get("temperatura_ambiente", ""),
+                "humedad_pct":    registro.get("humedad", ""),
+                "potencia_w":     registro.get("potencia_w", ""),
+                "energia_kwh":    registro.get("energia_kwh", ""),
+                "ac_encendido":   registro.get("ac_encendido", ""),
+                "presencia":      registro.get("presencia", ""),
+            })
         output.seek(0)
         return StreamingResponse(
             iter([output.getvalue()]),

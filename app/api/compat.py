@@ -68,6 +68,32 @@ def _resolver_pabellon_y_aire(sala: dict, aire_param: Optional[str] = None) -> t
     return pabellon, aire
 
 
+def _valor_presencia_reporte(registro: dict):
+    presencia = registro.get("presencia")
+    if presencia is not None:
+        return presencia
+
+    estado_ocupacion = registro.get("estado_ocupacion")
+    if estado_ocupacion is not None:
+        return estado_ocupacion
+
+    movimiento = registro.get("movimiento")
+    if movimiento is not None:
+        try:
+            return int(movimiento) > 0
+        except (TypeError, ValueError):
+            return movimiento
+
+    return ""
+
+
+def _valor_ac_encendido_reporte(registro: dict):
+    ac_encendido = registro.get("ac_encendido")
+    if ac_encendido is not None:
+        return ac_encendido
+    return registro.get("aire_encendido_atmos", "")
+
+
 def _mapear_alerta(alerta: dict) -> dict:
     return {
         **alerta,
@@ -501,7 +527,21 @@ async def reporte_energia(carga: dict | None = None):
         output = io.StringIO()
         writer = csv.DictWriter(
             output,
-            fieldnames=["fecha", "salon", "aire", "temperatura_c", "humedad_pct", "potencia_w", "energia_kwh", "ac_encendido", "presencia"],
+            fieldnames=[
+                "fecha",
+                "salon",
+                "aire",
+                "temperatura_c",
+                "temperatura_salida_aire_c",
+                "humedad_pct",
+                "movimiento",
+                "presencia",
+                "estado_ocupacion",
+                "potencia_w",
+                "energia_kwh",
+                "ac_encendido",
+                "ultima_accion_ejecutada",
+            ],
             extrasaction="ignore",
         )
         writer.writeheader()
@@ -514,11 +554,15 @@ async def reporte_energia(carga: dict | None = None):
                 "salon":          nombre_salon,
                 "aire":           aire,
                 "temperatura_c":  registro.get("temperatura_ambiente", ""),
+                "temperatura_salida_aire_c": registro.get("temperatura_salida_aire", ""),
                 "humedad_pct":    registro.get("humedad", ""),
+                "movimiento":     registro.get("movimiento", ""),
+                "presencia":      _valor_presencia_reporte(registro),
+                "estado_ocupacion": registro.get("estado_ocupacion", ""),
                 "potencia_w":     registro.get("potencia_w", ""),
                 "energia_kwh":    registro.get("energia_kwh", ""),
-                "ac_encendido":   registro.get("ac_encendido", ""),
-                "presencia":      registro.get("presencia", ""),
+                "ac_encendido":   _valor_ac_encendido_reporte(registro),
+                "ultima_accion_ejecutada": registro.get("ultima_accion_ejecutada", ""),
             })
         output.seek(0)
         return StreamingResponse(

@@ -71,16 +71,16 @@ def _resolver_pabellon_y_aire(sala: dict, aire_param: Optional[str] = None) -> t
 def _valor_presencia_reporte(registro: dict):
     presencia = registro.get("presencia")
     if presencia is not None:
-        return presencia
+        return 1 if presencia is True else 0 if presencia is False else presencia
 
     estado_ocupacion = registro.get("estado_ocupacion")
     if estado_ocupacion is not None:
-        return estado_ocupacion
+        return 1 if estado_ocupacion is True else 0 if estado_ocupacion is False else estado_ocupacion
 
     movimiento = registro.get("movimiento")
     if movimiento is not None:
         try:
-            return int(movimiento) > 0
+            return 1 if int(movimiento) > 0 else 0
         except (TypeError, ValueError):
             return movimiento
 

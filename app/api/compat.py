@@ -68,15 +68,14 @@ def _resolver_pabellon_y_aire(sala: dict, aire_param: Optional[str] = None) -> t
     return pabellon, aire
 
 
-def _valor_presencia_reporte(registro: dict):
-    presencia = registro.get("presencia")
-    if presencia is not None:
-        return 1 if presencia is True else 0 if presencia is False else presencia
+def _valor_ac_encendido_reporte(registro: dict):
+    ac_encendido = registro.get("ac_encendido")
+    if ac_encendido is not None:
+        return ac_encendido
+    return registro.get("aire_encendido_atmos", "")
 
-    estado_ocupacion = registro.get("estado_ocupacion")
-    if estado_ocupacion is not None:
-        return 1 if estado_ocupacion is True else 0 if estado_ocupacion is False else estado_ocupacion
 
+def _valor_movimiento_reporte(registro: dict):
     movimiento = registro.get("movimiento")
     if movimiento is not None:
         try:
@@ -84,14 +83,15 @@ def _valor_presencia_reporte(registro: dict):
         except (TypeError, ValueError):
             return movimiento
 
+    estado_ocupacion = registro.get("estado_ocupacion")
+    if estado_ocupacion is not None:
+        return 1 if estado_ocupacion is True else 0 if estado_ocupacion is False else estado_ocupacion
+
+    presencia = registro.get("presencia")
+    if presencia is not None:
+        return 1 if presencia is True else 0 if presencia is False else presencia
+
     return ""
-
-
-def _valor_ac_encendido_reporte(registro: dict):
-    ac_encendido = registro.get("ac_encendido")
-    if ac_encendido is not None:
-        return ac_encendido
-    return registro.get("aire_encendido_atmos", "")
 
 
 def _mapear_alerta(alerta: dict) -> dict:
@@ -535,8 +535,6 @@ async def reporte_energia(carga: dict | None = None):
                 "temperatura_salida_aire_c",
                 "humedad_pct",
                 "movimiento",
-                "presencia",
-                "estado_ocupacion",
                 "potencia_w",
                 "energia_kwh",
                 "ac_encendido",
@@ -557,9 +555,7 @@ async def reporte_energia(carga: dict | None = None):
                 "temperatura_c":  registro.get("temperatura_ambiente", ""),
                 "temperatura_salida_aire_c": registro.get("temperatura_salida_aire", ""),
                 "humedad_pct":    registro.get("humedad", ""),
-                "movimiento":     registro.get("movimiento", ""),
-                "presencia":      _valor_presencia_reporte(registro),
-                "estado_ocupacion": registro.get("estado_ocupacion", ""),
+                "movimiento":     _valor_movimiento_reporte(registro),
                 "potencia_w":     registro.get("potencia_w", ""),
                 "energia_kwh":    registro.get("energia_kwh", ""),
                 "ac_encendido":   _valor_ac_encendido_reporte(registro),

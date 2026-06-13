@@ -540,6 +540,7 @@ async def reporte_energia(carga: dict | None = None):
                 "potencia_w",
                 "energia_kwh",
                 "ac_encendido",
+                "recomendacion_local",
                 "ultima_accion_ejecutada",
             ],
             extrasaction="ignore",
@@ -562,7 +563,11 @@ async def reporte_energia(carga: dict | None = None):
                 "potencia_w":     registro.get("potencia_w", ""),
                 "energia_kwh":    registro.get("energia_kwh", ""),
                 "ac_encendido":   _valor_ac_encendido_reporte(registro),
-                "ultima_accion_ejecutada": registro.get("ultima_accion_ejecutada", ""),
+                "recomendacion_local": registro.get("recomendacion_local", ""),
+                "ultima_accion_ejecutada": (
+                    registro.get("ultima_accion_ejecutada")
+                    or registro.get("recomendacion_local", "")
+                ),
             })
         output.seek(0)
         return StreamingResponse(

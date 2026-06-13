@@ -15,6 +15,13 @@ from app.services.sincronizador_firebase import leer_ultima_lectura_valida_fireb
 MODELO_ATMOS_PATH = Path(__file__).with_name("modelo_atmos (1).pkl")
 VERSION_MODELO_ATMOS = "modelo_atmos_rf_v1"
 FEATURES_MODELO_ATMOS = ["presencia", "temp_ambiente", "temp_ac", "delta_t", "humedad"]
+FEATURES_PUBLICAS_ATMOS = [
+    "presencia",
+    "temp_ambiente",
+    "temperatura_salida_aire",
+    "delta_t",
+    "humedad",
+]
 ZONA_HORARIA_ATMOS = timezone(timedelta(hours=-5), "America/Panama")
 HORA_INICIO_OPERACION = time(7, 0)
 HORA_FIN_OPERACION = time(22, 45)
@@ -34,6 +41,9 @@ class ServicioPredictor:
     def decidir_atmos(self, datos: dict) -> dict:
         sala_id = datos.pop("sala_id", None)
         nodo_id = datos.pop("nodo_id", None)
+        if datos.get("temp_ac") is None and datos.get("temperatura_salida_aire") is not None:
+            datos["temp_ac"] = datos["temperatura_salida_aire"]
+        datos.pop("temperatura_salida_aire", None)
 
         if datos.get("presencia") == 1:
             datos["minutos_sin_presencia"] = 0
@@ -141,8 +151,8 @@ class ServicioPredictor:
             "lecturas_invalidas_ignoradas": seleccion["lecturas_invalidas_ignoradas"],
             "diagnostico": seleccion.get("diagnostico"),
             "advertencias": seleccion["advertencias"],
-            "entrada_modelo": datos_atmos,
-            "resultado_modelo": resultado,
+            "entrada_modelo": self.publicar_entrada_modelo(datos_atmos),
+            "resultado_modelo": self.publicar_resultado_modelo(resultado),
             "modelo_ml": modelo_ml,
             "accion": accion,
             "horario": horario,
@@ -155,16 +165,14 @@ class ServicioPredictor:
         try:
             modelo = cargar_modelo_atmos()
             tipo_modelo = type(modelo).__name__
-            features = list(getattr(modelo, "feature_names_in_", FEATURES_MODELO_ATMOS))
         except Exception:
             tipo_modelo = None
-            features = FEATURES_MODELO_ATMOS
 
         return {
             "modelo_disponible": MODELO_ATMOS_PATH.exists(),
             "tipo_modelo": tipo_modelo,
             "version_modelo": VERSION_MODELO_ATMOS,
-            "features_requeridas": features,
+            "features_requeridas": FEATURES_PUBLICAS_ATMOS,
         }
 
     def trazabilidad_modelo_no_usado(
@@ -176,7 +184,7 @@ class ServicioPredictor:
             **self.informacion_modelo(),
             "modelo_usado": False,
             "motivo_no_usado": motivo,
-            "features_usadas": features_usadas,
+            "features_usadas": self.publicar_features_modelo(features_usadas),
             "prediccion_modelo": None,
             "probabilidades": None,
         }
@@ -200,14 +208,14 @@ class ServicioPredictor:
             **self.informacion_modelo(),
             "modelo_usado": True,
             "motivo_no_usado": None,
-            "features_usadas": features,
+            "features_usadas": self.publicar_features_modelo(features),
             "prediccion_modelo": (resultado.get("modelo") or {}).get("decision_ml"),
             "probabilidades": probabilidades,
         }
 
     def construir_features_modelo(self, datos_atmos: dict) -> dict:
         temp_ambiente = datos_atmos.get("temp_ambiente")
-        temp_ac = datos_atmos.get("temp_ac")
+        temp_ac = datos_atmos.get("temp_ac", datos_atmos.get("temperatura_salida_aire"))
         try:
             delta_t = float(temp_ambiente) - float(temp_ac)
         except (TypeError, ValueError):
@@ -220,6 +228,34 @@ class ServicioPredictor:
             "delta_t": round(delta_t, 2) if isinstance(delta_t, (int, float)) else delta_t,
             "humedad": datos_atmos.get("humedad"),
         }
+
+    def publicar_features_modelo(self, features: dict | None) -> dict | None:
+        if features is None:
+            return None
+
+        publicas = dict(features)
+        if "temp_ac" in publicas:
+            publicas["temperatura_salida_aire"] = publicas.pop("temp_ac")
+        return publicas
+
+    def publicar_entrada_modelo(self, datos_atmos: dict | None) -> dict | None:
+        if datos_atmos is None:
+            return None
+
+        entrada = dict(datos_atmos)
+        if "temp_ac" in entrada:
+            entrada["temperatura_salida_aire"] = entrada.pop("temp_ac")
+        return entrada
+
+    def publicar_resultado_modelo(self, resultado: dict | None) -> dict | None:
+        if resultado is None:
+            return None
+
+        publicado = dict(resultado)
+        lectura = publicado.get("lectura")
+        if isinstance(lectura, dict):
+            publicado["lectura"] = self.publicar_entrada_modelo(lectura)
+        return publicado
 
     def obtener_estado_horario_operacion(self, ahora: datetime | None = None) -> dict:
         ahora = ahora or datetime.now(ZONA_HORARIA_ATMOS)
@@ -340,6 +376,7 @@ class ServicioPredictor:
             "presencia": presencia,
             "temp_ambiente": temp_ambiente,
             "temp_ac": temp_ac,
+            "temperatura_salida_aire": temp_ac,
             "humedad": float(buscar("humedad")),
             "minutos_sin_presencia": int(buscar(
                 "minutos_sin_presencia",

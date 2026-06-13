@@ -68,7 +68,7 @@ def validar_lectura(presencia, temp_ambiente, temp_ac, humedad, minutos_sin_pres
         errores.append("La temperatura ambiente está fuera de un rango lógico (10°C a 45°C).")
 
     if temp_ac < 5 or temp_ac > 35:
-        errores.append("La temperatura del AC está fuera de un rango lógico (5°C a 35°C).")
+        errores.append("La temperatura_salida_aire esta fuera de un rango logico (5 C a 35 C).")
 
     if humedad < 0 or humedad > 100:
         errores.append("La humedad debe estar entre 0% y 100%.")
@@ -350,7 +350,7 @@ def ejecutar_atmos(
         "lectura": {
             "presencia": presencia,
             "temp_ambiente": temp_ambiente,
-            "temp_ac": temp_ac,
+            "temperatura_salida_aire": temp_ac,
             "delta_t": round(delta_t, 2),
             "humedad": humedad,
             "minutos_sin_presencia": minutos_sin_presencia

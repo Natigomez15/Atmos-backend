@@ -31,7 +31,8 @@ class EntradaAtmos(BaseModel):
     nodo_id: Optional[UUID] = None
     presencia: Annotated[int, Field(ge=0, le=1)]
     temp_ambiente: Annotated[float, Field(ge=10, le=45)]
-    temp_ac: Annotated[float, Field(ge=5, le=35)]
+    temperatura_salida_aire: Optional[float] = Field(default=None, ge=5, le=35)
+    temp_ac: Optional[float] = Field(default=None, ge=5, le=35)
     humedad: Annotated[float, Field(ge=0, le=100)]
     minutos_sin_presencia: Annotated[int, Field(ge=0)] = 0
     minutos_enfriando: Annotated[int, Field(ge=0)] = 0
@@ -48,12 +49,20 @@ class EntradaAtmosFirebase(BaseModel):
 
 def _mapear_prediccion(prediccion: dict) -> dict:
     instantanea = prediccion.get("instantanea_caracteristicas") or {}
+    features_usadas = instantanea.get("features_usadas")
+    if isinstance(features_usadas, dict) and "temp_ac" in features_usadas:
+        features_usadas = dict(features_usadas)
+        features_usadas["temperatura_salida_aire"] = features_usadas.pop("temp_ac")
+        instantanea = {
+            **instantanea,
+            "features_usadas": features_usadas,
+        }
     modelo_ml = {
         "modelo_disponible": True,
         "modelo_usado": instantanea.get("fuente") == "modelo_pkl",
         "tipo_modelo": "RandomForestClassifier",
         "version_modelo": prediccion.get("version_modelo"),
-        "features_usadas": instantanea.get("features_usadas"),
+        "features_usadas": features_usadas,
         "prediccion_modelo": instantanea.get("prediccion_modelo"),
         "probabilidades": instantanea.get("probabilidades"),
         "accion_final": instantanea.get("accion_final"),
@@ -66,7 +75,7 @@ def _mapear_prediccion(prediccion: dict) -> dict:
         "predicted_savings_pct": prediccion.get("ahorro_predicho_pct"),
         "confidence_score": prediccion.get("puntaje_confianza"),
         "model_version": prediccion.get("version_modelo"),
-        "snapshot_features": prediccion.get("instantanea_caracteristicas"),
+        "snapshot_features": instantanea,
         "actual_savings_pct": prediccion.get("ahorro_real_pct"),
         "was_applied": prediccion.get("fue_aplicado"),
         "predicted_at": prediccion.get("predicho_en"),
@@ -147,6 +156,7 @@ def _fallback_prediccion_desde_registro(sala_id: UUID) -> dict:
     )
     features = {
         "temperatura_ambiente": registro.get("temperatura_ambiente"),
+        "temperatura_salida_aire": registro.get("temperatura_salida_aire"),
         "humedad": registro.get("humedad"),
         "estado_ocupacion": registro.get("estado_ocupacion"),
         "potencia_w": registro.get("potencia_w"),
@@ -198,7 +208,15 @@ def _fallback_prediccion_desde_registro(sala_id: UUID) -> dict:
 @limitador.limit("60/minute")
 @enrutador.post("/atmos/decidir")
 async def decidir_atmos(request: Request, entrada: EntradaAtmos):
-    resultado = ServicioPredictor().decidir_atmos(entrada.model_dump())
+    carga = entrada.model_dump()
+    if carga.get("temp_ac") is None:
+        carga["temp_ac"] = carga.get("temperatura_salida_aire")
+    if carga.get("temp_ac") is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Falta temperatura_salida_aire para ejecutar el modelo ATMOS",
+        )
+    resultado = ServicioPredictor().decidir_atmos(carga)
     if not resultado.get("valido", False):
         raise HTTPException(status_code=422, detail=resultado)
     return resultado

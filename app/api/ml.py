@@ -104,9 +104,12 @@ def _texto_accion(accion: str | None) -> str:
     acciones = {
         "apagar": "Apagar aire",
         "mantener": "Mantener estado actual",
+        "mantener_monitoreo": "Mantener estado actual",
+        "esperar_apagado": "Mantener estado actual",
         "encender_22": "Encender a 22 °C",
         "ahorro_24": "Modo ahorro a 24 °C",
         "enfriar_fuerte": "Enfriamiento fuerte",
+        "fuera_horario_apagar": "Apagar aire por horario",
     }
     return acciones.get(str(accion or "").strip().lower(), "Sin recomendación operativa")
 

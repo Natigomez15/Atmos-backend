@@ -8,7 +8,8 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.config import configuracion
-from app.core.database import obtener_cliente
+from app.core.database import obtener_cliente, obtener_firebase
+from app.core.logger import log
 from app.core.security import requerir_mantenimiento_o_admin
 from app.ml.impacto import TARIFA_KWH
 from app.models.schemas import SalaActualizar, SalaCrear
@@ -133,6 +134,145 @@ def _normalizar_payload_comando(payload: dict) -> dict:
         "modo": payload.get("modo") or payload.get("mode"),
         "origen": payload.get("origen") or payload.get("source") or "manual",
     }
+
+
+def _traducir_comando_manual_a_accion_esp32(payload: dict) -> str:
+    tipo = str(payload.get("tipo_comando") or "").strip().lower()
+    setpoint = payload.get("setpoint")
+
+    try:
+        setpoint_int = int(setpoint) if setpoint is not None else None
+    except (TypeError, ValueError):
+        setpoint_int = None
+
+    if tipo == "off":
+        return "apagar"
+    if tipo == "on":
+        if setpoint_int == 23:
+            return "encender_23"
+        return "encender_22"
+    if tipo == "setpoint":
+        if setpoint_int is None:
+            return "mantener"
+        if setpoint_int <= 21:
+            return "enfriar_fuerte"
+        if setpoint_int == 22:
+            return "encender_22"
+        if setpoint_int == 23:
+            return "encender_23"
+        if setpoint_int == 24:
+            return "ahorro_24"
+        return "mantener"
+    return "mantener"
+
+
+def _resolver_sala_para_comando(cliente, sala_id: str) -> dict | None:
+    respuesta = (
+        cliente.table("rooms")
+        .select("*")
+        .eq("id", str(sala_id))
+        .single()
+        .execute()
+    )
+    return respuesta.data
+
+
+def _resolver_destino_firebase_comando(
+    sala: dict,
+    raw_payload: dict,
+) -> tuple[str | None, str | None]:
+    pabellon = (
+        sala.get("pabellon")
+        or sala.get("building")
+        or sala.get("area")
+        or sala.get("edificio")
+    )
+    aire_param = (
+        raw_payload.get("aire")
+        or raw_payload.get("ac")
+        or raw_payload.get("air")
+        or raw_payload.get("nombre_aire")
+    )
+    aires = sala.get("aires") or []
+    if aire_param:
+        aire = aire_param
+    elif aires:
+        aire = aires[0]
+    else:
+        aire = sala.get("aire") or sala.get("name") or sala.get("nombre")
+    return pabellon, aire
+
+
+def _escribir_accion_manual_en_firebase(
+    *,
+    cliente,
+    payload: dict,
+    raw_payload: dict,
+) -> dict:
+    accion = _traducir_comando_manual_a_accion_esp32(payload)
+    resultado = {
+        "accion_firebase": accion,
+        "ruta_firebase": None,
+        "firebase_escrito": False,
+        "error_firebase": None,
+        "advertencia_firebase": None,
+    }
+
+    try:
+        sala = _resolver_sala_para_comando(cliente, payload["sala_id"])
+        if not sala:
+            resultado["advertencia_firebase"] = (
+                f"No se encontro sala {payload['sala_id']} en rooms; "
+                "comando guardado solo en Supabase."
+            )
+            log.warning({
+                "evento": "comando_manual_firebase_sala_no_encontrada",
+                "sala_id": str(payload["sala_id"]),
+                "accion": accion,
+            })
+            return resultado
+
+        pabellon, aire = _resolver_destino_firebase_comando(sala, raw_payload)
+        if not pabellon or not aire:
+            resultado["advertencia_firebase"] = (
+                "No se pudo resolver pabellon/aire desde rooms; "
+                "comando guardado solo en Supabase."
+            )
+            log.warning({
+                "evento": "comando_manual_firebase_destino_incompleto",
+                "sala_id": str(payload["sala_id"]),
+                "pabellon": pabellon,
+                "aire": aire,
+                "accion": accion,
+            })
+            return resultado
+
+        ruta = f"/Atmos/comandos/{pabellon}/{aire}/accion"
+        resultado["ruta_firebase"] = ruta
+
+        firebase_db = obtener_firebase()
+        firebase_db.child("Atmos").child("comandos").child(pabellon).child(aire).update({
+            "accion": accion,
+        })
+        resultado["firebase_escrito"] = True
+        log.info({
+            "evento": "comando_manual_firebase_escrito",
+            "sala_id": str(payload["sala_id"]),
+            "pabellon": pabellon,
+            "aire": aire,
+            "accion": accion,
+            "ruta": ruta,
+        })
+    except Exception as error:
+        resultado["error_firebase"] = str(error)
+        log.error({
+            "evento": "comando_manual_firebase_error",
+            "sala_id": str(payload.get("sala_id")),
+            "accion": accion,
+            "error": str(error),
+        })
+
+    return resultado
 
 
 @enrutador.get("/rooms")
@@ -450,7 +590,8 @@ async def listar_ac_commands(
 
 @enrutador.post("/ac-commands", status_code=201)
 async def crear_ac_command(request: Request):
-    payload = _normalizar_payload_comando(await request.json())
+    raw_payload = await request.json()
+    payload = _normalizar_payload_comando(raw_payload)
     if not payload.get("sala_id") or not payload.get("tipo_comando"):
         raise HTTPException(status_code=422, detail="Faltan room_id o command_type")
     if payload["tipo_comando"] == "setpoint" and payload.get("setpoint") is None:
@@ -465,7 +606,28 @@ async def crear_ac_command(request: Request):
     respuesta = cliente.table("ac_commands").insert(datos).execute()
     if not respuesta.data:
         raise HTTPException(status_code=400, detail="Error al crear comando")
-    return _mapear_comando(respuesta.data[0])
+
+    comando_mapeado = _mapear_comando(respuesta.data[0])
+    resultado_firebase = _escribir_accion_manual_en_firebase(
+        cliente=cliente,
+        payload=payload,
+        raw_payload=raw_payload,
+    )
+    log.info({
+        "evento": "comando_manual_guardado",
+        "sala_id": str(payload["sala_id"]),
+        "tipo_comando": payload["tipo_comando"],
+        "setpoint": payload.get("setpoint"),
+        "supabase_guardado": True,
+        "firebase_escrito": resultado_firebase["firebase_escrito"],
+        "accion_firebase": resultado_firebase["accion_firebase"],
+    })
+    return {
+        **comando_mapeado,
+        "command_saved_in_supabase": True,
+        "supabase_guardado": True,
+        **resultado_firebase,
+    }
 
 
 @enrutador.post("/ac-commands/from-prediction/{prediccion_id}", status_code=201)

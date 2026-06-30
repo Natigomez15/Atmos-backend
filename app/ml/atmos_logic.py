@@ -1,5 +1,7 @@
 
-import pandas as pd
+def _pd():
+    import pandas as pd
+    return pd
 
 
 # ==========================================
@@ -89,7 +91,7 @@ def validar_lectura(presencia, temp_ambiente, temp_ac, humedad, minutos_sin_pres
 def predecir_lectura(modelo, presencia, temp_ambiente, temp_ac, humedad):
     delta_t = temp_ambiente - temp_ac
 
-    lectura = pd.DataFrame([{
+    lectura = _pd().DataFrame([{
         "presencia": presencia,
         "temp_ambiente": temp_ambiente,
         "temp_ac": temp_ac,
@@ -107,7 +109,7 @@ def predecir_lectura(modelo, presencia, temp_ambiente, temp_ac, humedad):
 # ==========================================
 
 def aplicar_capa_seguridad(decision_ml, presencia, temp_ambiente, temp_ac, delta_t, humedad):
-    caso = pd.Series({
+    caso = _pd().Series({
         "presencia": presencia,
         "temp_ambiente": temp_ambiente,
         "temp_ac": temp_ac,
@@ -291,7 +293,7 @@ def ejecutar_atmos(
         humedad
     )
 
-    lectura_prob = pd.DataFrame([{
+    lectura_prob = _pd().DataFrame([{
         "presencia": presencia,
         "temp_ambiente": temp_ambiente,
         "temp_ac": temp_ac,

@@ -7,6 +7,7 @@ from uuid import UUID
 import httpx
 
 from app.config import configuracion
+from app.core.aires import es_aire_ignorado
 from app.core.database import obtener_cliente, obtener_firebase
 from app.ml.impacto import estimar_consumo_registro, inferir_accion, inferir_ac_encendido
 
@@ -562,6 +563,14 @@ def sincronizar_firebase_supabase(
             continue
 
         for aire, contenido in aires.items():
+            if es_aire_ignorado(aire):
+                etapas.append({
+                    "paso": "skip_aire_ignorado",
+                    "pabellon": pabellon,
+                    "aire": aire,
+                })
+                continue
+
             if not isinstance(contenido, dict):
                 continue
 

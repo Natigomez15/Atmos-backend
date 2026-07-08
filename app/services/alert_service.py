@@ -1,6 +1,7 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 
+from app.core.aires import es_aire_ignorado
 from app.core.database import obtener_cliente
 from app.core.logger import log
 from app.core.websocket_manager import gestor
@@ -262,12 +263,40 @@ class ServicioAlertas:
         diagnostico: dict | None = None,
     ) -> dict:
         cliente = obtener_cliente()
-        sala_id = self._resolver_sala_id(cliente, pabellon, aire)
         creadas = 0
         actualizadas = 0
         resueltas = 0
         tipos: list[str] = []
         errores: list[str] = []
+
+        if es_aire_ignorado(aire):
+            resueltas += self._resolver_alertas_atmos(
+                cliente,
+                [
+                    "aire_sin_datos",
+                    "control_ir_inactivo",
+                    "temperatura_alta",
+                    "temperatura_fuera_rango",
+                    "humedad_alta",
+                    "humedad_invalida",
+                    "sensor_datos_invalidos",
+                ],
+                None,
+                pabellon,
+                aire,
+            )
+            return {
+                "verificadas": True,
+                "creadas": creadas,
+                "actualizadas": actualizadas,
+                "resueltas": resueltas,
+                "tipos": tipos,
+                "errores": errores,
+                "mensaje": f"{aire} esta excluido del monitoreo ATMOS.",
+                "omitido": True,
+            }
+
+        sala_id = self._resolver_sala_id(cliente, pabellon, aire)
 
         if diagnostico and diagnostico.get("posible_fallo_sensor") is True:
             detalle = {
@@ -520,7 +549,7 @@ class ServicioAlertas:
             pares = sorted({
                 (fila.get("pabellon"), fila.get("aire"))
                 for fila in (respuesta.data or [])
-                if fila.get("pabellon") and fila.get("aire")
+                if fila.get("pabellon") and fila.get("aire") and not es_aire_ignorado(fila.get("aire"))
             })
 
         resultados = []

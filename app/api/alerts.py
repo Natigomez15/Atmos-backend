@@ -3,12 +3,13 @@ from datetime import datetime, timezone
 from typing import Annotated, Literal, Optional
 from uuid import UUID
 
-from app.models.schemas import AlertaRespuesta
+from app.core.aires import es_aire_ignorado
 from app.core.database import obtener_cliente
-from app.services.alert_service import ServicioAlertas
-from app.config import configuracion
 from app.core.limiter import limitador
 from app.core.security import requerir_mantenimiento_o_admin
+from app.config import configuracion
+from app.models.schemas import AlertaRespuesta
+from app.services.alert_service import ServicioAlertas
 from app.services.sincronizador_firebase import leer_ultima_lectura_valida_firebase_rest
 
 enrutador = APIRouter(prefix="/alertas", tags=["alertas"])
@@ -41,7 +42,10 @@ async def listar_alertas(
         consulta = consulta.eq("tipo_alerta", tipo_alerta)
 
     respuesta = consulta.execute()
-    return respuesta.data
+    return [
+        alerta for alerta in (respuesta.data or [])
+        if not es_aire_ignorado((alerta.get("detalle") or {}).get("aire"))
+    ]
 
 
 @enrutador.patch("/{alerta_id}/resolver", response_model=AlertaRespuesta)
@@ -76,7 +80,10 @@ async def resumen_alertas(request: Request):
         .eq("esta_resuelta", False)
         .execute()
     )
-    filas = respuesta.data
+    filas = [
+        alerta for alerta in (respuesta.data or [])
+        if not es_aire_ignorado((alerta.get("detalle") or {}).get("aire"))
+    ]
 
     total = len(filas)
     por_severidad = {"high": 0, "medium": 0, "low": 0}

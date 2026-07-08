@@ -1,7 +1,10 @@
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
 
-def _pd():
+try:
     import pandas as pd
-    return pd
+except ImportError:
+    pd = None
 
 
 # ==========================================
@@ -23,6 +26,55 @@ TIEMPO_ESPERA_APAGADO = 10  # minutos
 TIEMPO_MINIMO_FALLA = 30
 DESCENSO_MINIMO_ESPERADO = 3
 TEMP_AC_ALTA = 23
+
+
+# ==========================================
+# PARÁMETROS DE CONFIABILIDAD Y CONTROL IR
+# ==========================================
+
+# Estos valores no cambian el modelo. Sirven para decidir si una lectura
+# es suficientemente confiable como para ejecutar una señal IR real.
+MARGEN_TEMP_SENSORES = 1.0
+TEMP_SALIDA_AC_MUY_ALTA = 28
+TEMP_AMBIENTE_ALTA_PARA_VALIDAR = 28
+
+COMANDO_IR_APAGAR = "APAGAR"
+COMANDO_IR_TEMP_24 = "TEMP_24"
+COMANDO_IR_TEMP_23 = "TEMP_23"
+COMANDO_IR_TEMP_22 = "TEMP_22"
+COMANDO_IR_NINGUNO = "NINGUNO"
+ZONA_HORARIA_ATMOS = ZoneInfo("America/Panama")
+HORA_INICIO_OPERACION = time(6, 0)
+HORA_FIN_OPERACION = time(23, 0)
+COLUMNAS_MODELO = ["presencia", "temp_ambiente", "temp_ac", "delta_t", "humedad"]
+
+
+def crear_lectura_modelo(presencia, temp_ambiente, temp_ac, delta_t, humedad):
+    valores = {
+        "presencia": presencia,
+        "temp_ambiente": temp_ambiente,
+        "temp_ac": temp_ac,
+        "delta_t": delta_t,
+        "humedad": humedad,
+    }
+
+    if pd is not None:
+        return pd.DataFrame([valores])
+
+    return [[valores[columna] for columna in COLUMNAS_MODELO]]
+
+
+def dentro_de_horario_operacion(ahora=None):
+    if ahora is None:
+        ahora_panama = datetime.now(ZONA_HORARIA_ATMOS)
+    elif ahora.tzinfo is None:
+        ahora_panama = ahora.replace(tzinfo=ZONA_HORARIA_ATMOS)
+    else:
+        ahora_panama = ahora.astimezone(ZONA_HORARIA_ATMOS)
+
+    es_dia_operativo = ahora_panama.weekday() <= 5
+    hora_actual = ahora_panama.time()
+    return es_dia_operativo and HORA_INICIO_OPERACION <= hora_actual < HORA_FIN_OPERACION
 
 
 # ==========================================
@@ -70,7 +122,7 @@ def validar_lectura(presencia, temp_ambiente, temp_ac, humedad, minutos_sin_pres
         errores.append("La temperatura ambiente está fuera de un rango lógico (10°C a 45°C).")
 
     if temp_ac < 5 or temp_ac > 35:
-        errores.append("La temperatura_salida_aire esta fuera de un rango logico (5 C a 35 C).")
+        errores.append("La temperatura del AC está fuera de un rango lógico (5°C a 35°C).")
 
     if humedad < 0 or humedad > 100:
         errores.append("La humedad debe estar entre 0% y 100%.")
@@ -85,37 +137,107 @@ def validar_lectura(presencia, temp_ambiente, temp_ac, humedad, minutos_sin_pres
 
 
 # ==========================================
+# NUEVA CAPA: CONFIABILIDAD DE LECTURA
+# ==========================================
+
+def evaluar_confiabilidad_lectura(
+    presencia,
+    temp_ambiente,
+    temp_ac,
+    humedad,
+    delta_t,
+    minutos_sin_presencia=0
+):
+    """
+    Clasifica la lectura como confiable o dudosa.
+
+    Esta función NO reemplaza al modelo ML.
+    Su objetivo es evitar que el sistema mande señales IR automáticas
+    cuando los sensores entregan datos raros o poco consistentes.
+
+    Estados:
+    - confiable: se puede usar para recomendar y autorizar IR.
+    - dudosa: se puede usar para recomendar, pero se bloquea el IR automático.
+    """
+
+    motivos = []
+    estado_lectura = "confiable"
+
+    # Caso 1: la salida del AC aparece más caliente que el salón.
+    # Esto puede indicar sensor mal ubicado, lectura mezclada o dato inestable.
+    if temp_ac > temp_ambiente + MARGEN_TEMP_SENSORES:
+        motivos.append(
+            "La temperatura de salida del AC aparece mayor que la temperatura ambiente. "
+            "La lectura puede estar afectada por ubicación del sensor o ruido."
+        )
+
+    # Caso 2: el salón está caliente, pero el sensor del AC marca aire muy caliente.
+    # En pruebas reales esto puede significar que el sensor no está midiendo bien la salida del aire
+    # o que el AC no está enfriando correctamente.
+    if temp_ambiente >= TEMP_AMBIENTE_ALTA_PARA_VALIDAR and temp_ac >= TEMP_SALIDA_AC_MUY_ALTA:
+        motivos.append(
+            "El salón está caliente y la salida del AC también aparece caliente. "
+            "Se considera lectura dudosa para control automático."
+        )
+
+    # Caso 3: en condiciones de calor, la temperatura ambiente y la de salida del AC son casi iguales.
+    # Eso no necesariamente invalida el dato, pero no es ideal para mandar comandos automáticos.
+    if temp_ambiente >= TEMP_AMBIENTE_ALTA_PARA_VALIDAR and abs(delta_t) <= MARGEN_TEMP_SENSORES:
+        motivos.append(
+            "La temperatura ambiente y la temperatura de salida del AC son demasiado parecidas "
+            "en una condición de calor. Puede ser sensor mal ubicado o lectura poco representativa."
+        )
+
+    # Caso 4: humedad extrema. No se invalida, pero se marca como dudosa.
+    if humedad <= 5 or humedad >= 98:
+        motivos.append(
+            "La humedad está en un extremo poco común. Se recomienda revisar el sensor de humedad."
+        )
+
+    if len(motivos) > 0:
+        estado_lectura = "dudosa"
+
+    puede_ejecutar_ir = estado_lectura == "confiable"
+
+    if estado_lectura == "confiable":
+        mensaje = "Lectura confiable. El sistema puede recomendar y autorizar control IR si corresponde."
+    else:
+        mensaje = "Lectura dudosa. El sistema puede recomendar, pero bloquea el control IR automático."
+
+    return {
+        "estado_lectura": estado_lectura,
+        "puede_ejecutar_ir": puede_ejecutar_ir,
+        "motivos": motivos,
+        "mensaje": mensaje
+    }
+
+
+# ==========================================
 # PREDICCIÓN DE UNA LECTURA
 # ==========================================
 
 def predecir_lectura(modelo, presencia, temp_ambiente, temp_ac, humedad):
     delta_t = temp_ambiente - temp_ac
 
-    lectura = _pd().DataFrame([{
-        "presencia": presencia,
-        "temp_ambiente": temp_ambiente,
-        "temp_ac": temp_ac,
-        "delta_t": delta_t,
-        "humedad": humedad
-    }])
+    lectura = crear_lectura_modelo(presencia, temp_ambiente, temp_ac, delta_t, humedad)
 
-    decision_ml = modelo.predict(lectura)[0]
+    decision_ml = str(modelo.predict(lectura)[0])
 
     return decision_ml, delta_t
 
 
 # ==========================================
-# CAPA DE SEGURIDAD
+# CAPA DE SEGURIDAD DEL MODELO
 # ==========================================
 
 def aplicar_capa_seguridad(decision_ml, presencia, temp_ambiente, temp_ac, delta_t, humedad):
-    caso = _pd().Series({
+    caso = {
         "presencia": presencia,
         "temp_ambiente": temp_ambiente,
         "temp_ac": temp_ac,
         "delta_t": delta_t,
         "humedad": humedad
-    })
+    }
 
     decision_regla = decidir(caso)
 
@@ -206,6 +328,94 @@ def traducir_decision_ac(decision_final, temp_ambiente):
 
 
 # ==========================================
+# NUEVA CAPA: COMANDO IR Y AUTORIZACIÓN
+# ==========================================
+
+def obtener_comando_ir_sugerido(decision_final, accion_ac):
+    """
+    Convierte la decisión final del sistema en un nombre de comando IR.
+    Aquí NO se pone el código raw IR todavía; solo el nombre lógico.
+    El ESP32 o backend debe mapear estos nombres a los códigos IR reales.
+    """
+
+    temperatura_objetivo = accion_ac.get("temperatura_objetivo")
+
+    if decision_final == "apagar":
+        return COMANDO_IR_APAGAR
+
+    if decision_final == "mantener" and temperatura_objetivo == TEMP_MANTENER:
+        return COMANDO_IR_TEMP_24
+
+    if decision_final == "enfriar_fuerte" and temperatura_objetivo == TEMP_ENFRIAR_MODERADO:
+        return COMANDO_IR_TEMP_23
+
+    if decision_final == "enfriar_fuerte" and temperatura_objetivo == TEMP_ENFRIAR_FUERTE:
+        return COMANDO_IR_TEMP_22
+
+    return COMANDO_IR_NINGUNO
+
+
+def autorizar_control_ir(
+    decision_final,
+    accion_ac,
+    confiabilidad,
+    ultima_accion_ir=None,
+    modo_control="experimental"
+):
+    """
+    Decide si se autoriza mandar una señal IR real.
+
+    Reglas:
+    - Si el modo es 'recomendacion', nunca ejecuta IR.
+    - Si la lectura es dudosa, bloquea IR.
+    - Si la decisión es esperar_apagado, no envía IR.
+    - Si el comando es igual al último enviado, evita repetirlo.
+    """
+
+    comando_sugerido = obtener_comando_ir_sugerido(decision_final, accion_ac)
+    motivos = []
+
+    ejecutar_ir = True
+
+    if modo_control == "recomendacion":
+        ejecutar_ir = False
+        motivos.append("Modo recomendación activo: no se ejecutan señales IR automáticas.")
+
+    if confiabilidad["estado_lectura"] != "confiable":
+        ejecutar_ir = False
+        motivos.append("Control IR bloqueado porque la lectura fue clasificada como dudosa.")
+
+    if decision_final == "esperar_apagado":
+        ejecutar_ir = False
+        motivos.append("No se envía IR porque el sistema está esperando completar el temporizador de ausencia.")
+
+    if comando_sugerido == COMANDO_IR_NINGUNO:
+        ejecutar_ir = False
+        motivos.append("No hay comando IR asociado a esta decisión.")
+
+    if ultima_accion_ir is not None and comando_sugerido == ultima_accion_ir:
+        ejecutar_ir = False
+        motivos.append("No se repite el comando IR porque ya fue enviado anteriormente.")
+
+    if ejecutar_ir:
+        comando_ir = comando_sugerido
+        mensaje = f"Control IR autorizado. Comando a ejecutar: {comando_ir}."
+    else:
+        comando_ir = COMANDO_IR_NINGUNO
+        if len(motivos) == 0:
+            motivos.append("Control IR no autorizado.")
+        mensaje = " ".join(motivos)
+
+    return {
+        "ejecutar_ir": ejecutar_ir,
+        "comando_ir": comando_ir,
+        "comando_ir_sugerido": comando_sugerido,
+        "accion_enviada": False,
+        "motivo_autorizacion": mensaje
+    }
+
+
+# ==========================================
 # DETECCIÓN DE FALLAS
 # ==========================================
 
@@ -268,7 +478,9 @@ def ejecutar_atmos(
     temp_inicio=None,
     temp_actual=None,
     temp_ac_actual=None,
-    usar_capa_seguridad=True
+    usar_capa_seguridad=True,
+    ultima_accion_ir=None,
+    modo_control="experimental"
 ):
     validacion = validar_lectura(
         presencia,
@@ -282,7 +494,19 @@ def ejecutar_atmos(
         return {
             "valido": False,
             "errores": validacion["errores"],
-            "mensaje": "La lectura no pudo procesarse porque contiene datos inválidos."
+            "mensaje": "La lectura no pudo procesarse porque contiene datos inválidos.",
+            "seguridad": {
+                "estado_lectura": "invalida",
+                "puede_ejecutar_ir": False,
+                "comando_ir": COMANDO_IR_NINGUNO,
+                "mensaje": "No se ejecuta el modelo ni el control IR porque la lectura es inválida."
+            },
+            "control": {
+                "decision_final": "no_procesada",
+                "ejecutar_ir": False,
+                "comando_ir": COMANDO_IR_NINGUNO,
+                "accion_enviada": False
+            }
         }
 
     decision_ml, delta_t = predecir_lectura(
@@ -293,20 +517,23 @@ def ejecutar_atmos(
         humedad
     )
 
-    lectura_prob = _pd().DataFrame([{
-        "presencia": presencia,
-        "temp_ambiente": temp_ambiente,
-        "temp_ac": temp_ac,
-        "delta_t": delta_t,
-        "humedad": humedad
-    }])
+    lectura_prob = crear_lectura_modelo(presencia, temp_ambiente, temp_ac, delta_t, humedad)
 
     probabilidades_array = modelo.predict_proba(lectura_prob)[0]
 
     probabilidades = {
-        clase: float(round(prob * 100, 2))
+        str(clase): float(round(prob * 100, 2))
         for clase, prob in zip(modelo.classes_, probabilidades_array)
     }
+
+    confiabilidad = evaluar_confiabilidad_lectura(
+        presencia,
+        temp_ambiente,
+        temp_ac,
+        humedad,
+        delta_t,
+        minutos_sin_presencia
+    )
 
     if usar_capa_seguridad:
         decision_segura, mensaje_seguridad = aplicar_capa_seguridad(
@@ -319,7 +546,7 @@ def ejecutar_atmos(
         )
     else:
         decision_segura = decision_ml
-        mensaje_seguridad = "Capa de seguridad desactivada."
+        mensaje_seguridad = "Capa de seguridad del modelo desactivada."
 
     decision_final = aplicar_temporizador(
         decision_segura,
@@ -330,6 +557,14 @@ def ejecutar_atmos(
     accion_ac = traducir_decision_ac(
         decision_final,
         temp_ambiente
+    )
+
+    autorizacion_ir = autorizar_control_ir(
+        decision_final,
+        accion_ac,
+        confiabilidad,
+        ultima_accion_ir=ultima_accion_ir,
+        modo_control=modo_control
     )
 
     if temp_inicio is not None and temp_actual is not None and temp_ac_actual is not None:
@@ -352,6 +587,7 @@ def ejecutar_atmos(
         "lectura": {
             "presencia": presencia,
             "temp_ambiente": temp_ambiente,
+            "temp_ac": temp_ac,
             "temperatura_salida_aire": temp_ac,
             "delta_t": round(delta_t, 2),
             "humedad": humedad,
@@ -363,11 +599,20 @@ def ejecutar_atmos(
         },
         "seguridad": {
             "decision_segura": decision_segura,
-            "mensaje": mensaje_seguridad
+            "mensaje": mensaje_seguridad,
+            "estado_lectura": confiabilidad["estado_lectura"],
+            "puede_ejecutar_ir": autorizacion_ir["ejecutar_ir"],
+            "motivos_confiabilidad": confiabilidad["motivos"],
+            "mensaje_confiabilidad": confiabilidad["mensaje"],
+            "motivo_control_ir": autorizacion_ir["motivo_autorizacion"]
         },
         "control": {
             "decision_final": decision_final,
-            "accion_ac": accion_ac
+            "accion_ac": accion_ac,
+            "ejecutar_ir": autorizacion_ir["ejecutar_ir"],
+            "comando_ir": autorizacion_ir["comando_ir"],
+            "comando_ir_sugerido": autorizacion_ir["comando_ir_sugerido"],
+            "accion_enviada": autorizacion_ir["accion_enviada"]
         },
         "deteccion_fallas": falla_ac
     }

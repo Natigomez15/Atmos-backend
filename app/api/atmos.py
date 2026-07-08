@@ -30,11 +30,16 @@ def procesar_lectura_atmos(
         raise HTTPException(status_code=401, detail="Token ATMOS invalido")
 
     try:
+        servicio = ServicioPredictor()
+        horario = servicio.obtener_estado_horario_operacion()
+        if not horario["dentro_horario"]:
+            return servicio.respuesta_fuera_horario(horario)
+
         sincronizacion = sincronizar_firebase_supabase(
             pabellon_objetivo=pabellon,
             aire_objetivo=aire,
         )
-        decision = ServicioPredictor().decidir_atmos_desde_firebase(
+        decision = servicio.decidir_atmos_desde_firebase(
             area=pabellon,
             aire=aire,
         )

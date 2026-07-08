@@ -10,12 +10,13 @@ from fastapi.responses import StreamingResponse
 from app.config import configuracion
 from app.core.database import obtener_cliente, obtener_firebase
 from app.core.logger import log
-from app.core.security import requerir_mantenimiento_o_admin
+from app.core.security import obtener_usuario_opcional, requerir_mantenimiento_o_admin
 from app.ml.impacto import TARIFA_KWH
 from app.models.schemas import SalaActualizar, SalaCrear
 from app.api.ac_commands import comando_desde_prediccion
 from app.services.alert_service import ServicioAlertas
 from app.services.sincronizador_firebase import leer_ultima_lectura_valida_firebase_rest
+from app.core.aires import es_aire_ignorado
 
 
 enrutador = APIRouter(tags=["compatibilidad"])
@@ -93,6 +94,81 @@ def _valor_movimiento_reporte(registro: dict):
         return 1 if presencia is True else 0 if presencia is False else presencia
 
     return ""
+
+
+def _promedio_valores(filas: list[dict], campo: str) -> float | None:
+    valores = [fila[campo] for fila in filas if fila.get(campo) is not None]
+    if not valores:
+        return None
+    return round(sum(valores) / len(valores), 4)
+
+
+def _razon_presencia(filas: list[dict]) -> float | None:
+    valores = []
+    for fila in filas:
+        valor = fila.get("estado_ocupacion")
+        if valor is None:
+            valor = fila.get("presencia")
+        if valor is None:
+            movimiento = fila.get("movimiento")
+            if movimiento is not None:
+                try:
+                    valor = int(movimiento) > 0
+                except (TypeError, ValueError):
+                    valor = None
+        if valor is not None:
+            valores.append(bool(valor))
+    if not valores:
+        return None
+    return round(sum(1 for valor in valores if valor) / len(valores), 4)
+
+
+def _horas_ac_encendido(filas: list[dict]) -> float | None:
+    fechas_encendido = []
+    for fila in filas:
+        encendido = fila.get("aire_encendido_atmos")
+        if encendido is None:
+            encendido = fila.get("ac_encendido")
+        if encendido and fila.get("fecha_sync"):
+            fechas_encendido.append(fila["fecha_sync"])
+    if not fechas_encendido:
+        return None
+    return round(len(fechas_encendido), 2)
+
+
+def _calcular_energia_kwh(filas: list[dict]) -> float:
+    energias = [fila["energia_kwh"] for fila in filas if fila.get("energia_kwh") is not None]
+    if len(energias) >= 2:
+        return max(energias) - min(energias)
+    potencias = [fila["potencia_w"] for fila in filas if fila.get("potencia_w") is not None]
+    if potencias:
+        return sum(potencias) / len(potencias) / 1000
+    return 0
+
+
+def _guardar_historial_reporte(cliente, *, tipo: str, carga: dict | None, resultado: dict, usuario: dict | None = None):
+    periodo = (carga or {}).get("period", {})
+    datos = {
+        "report_type": tipo,
+        "period_start": periodo.get("start"),
+        "period_end": periodo.get("end"),
+        "room_count": len(resultado.get("rooms") or []),
+        "generated_at": resultado.get("generated_at"),
+        "profile_id": usuario.get("id") if usuario else None,
+        "metadata": {
+            "room_ids": (carga or {}).get("room_ids"),
+            "total_energy_kwh": resultado.get("total_energy_kwh"),
+            "total_cost_usd": resultado.get("total_cost_usd"),
+        },
+    }
+    try:
+        cliente.table("report_history").insert(datos).execute()
+    except Exception as error:
+        log.warning({
+            "evento": "historial_reporte_no_guardado",
+            "tabla": "report_history",
+            "error": str(error),
+        })
 
 
 def _mapear_alerta(alerta: dict) -> dict:
@@ -449,7 +525,11 @@ async def listar_alerts(
     if room_id is not None:
         consulta = consulta.eq("sala_id", str(room_id))
     respuesta = consulta.execute()
-    return [_mapear_alerta(alerta) for alerta in respuesta.data]
+    return [
+        _mapear_alerta(alerta)
+        for alerta in (respuesta.data or [])
+        if not es_aire_ignorado((alerta.get("detalle") or {}).get("aire"))
+    ]
 
 
 @enrutador.get("/alerts/summary")
@@ -457,11 +537,14 @@ async def resumen_alerts():
     cliente = obtener_cliente()
     respuesta = (
         cliente.table("alerts")
-        .select("severidad,tipo_alerta")
+        .select("severidad,tipo_alerta,detalle")
         .eq("esta_resuelta", False)
         .execute()
     )
-    filas = respuesta.data
+    filas = [
+        alerta for alerta in (respuesta.data or [])
+        if not es_aire_ignorado((alerta.get("detalle") or {}).get("aire"))
+    ]
     return {
         "total_unresolved": len(filas),
         "total_sin_resolver": len(filas),
@@ -570,17 +653,16 @@ async def listar_ac_commands(
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ):
     id_sala = sala_id or room_id
-    if not id_sala:
-        return []
 
     cliente = obtener_cliente()
     consulta = (
         cliente.table("ac_commands")
         .select("*")
-        .eq("sala_id", str(id_sala))
         .order("enviado_en", desc=True)
         .limit(limit)
     )
+    if id_sala:
+        consulta = consulta.eq("sala_id", str(id_sala))
     if only_pending is True or solo_pendientes is True:
         consulta = consulta.eq("fue_ejecutado", False)
 

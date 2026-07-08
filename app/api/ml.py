@@ -40,6 +40,8 @@ class EntradaAtmos(BaseModel):
     temp_actual: Optional[float] = None
     temp_ac_actual: Optional[float] = None
     usar_capa_seguridad: bool = True
+    ultima_accion_ir: Optional[str] = None
+    modo_control: str = "experimental"
 
 
 class EntradaAtmosFirebase(BaseModel):

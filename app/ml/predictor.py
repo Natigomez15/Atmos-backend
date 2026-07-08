@@ -2,12 +2,14 @@ from datetime import datetime, time, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import joblib
 
 from app.core.database import obtener_cliente
 from app.core.database import obtener_firebase
-from app.ml.atmos_logic import ejecutar_atmos
+from app.core.logger import log
+from app.ml.atmos_logic import dentro_de_horario_operacion, ejecutar_atmos
 from app.ml.impacto import CANTIDAD_AIRES, CONSUMO_AC_KW
 from app.services.sincronizador_firebase import leer_ultima_lectura_valida_firebase_rest
 
@@ -22,9 +24,9 @@ FEATURES_PUBLICAS_ATMOS = [
     "delta_t",
     "humedad",
 ]
-ZONA_HORARIA_ATMOS = timezone(timedelta(hours=-5), "America/Panama")
-HORA_INICIO_OPERACION = time(7, 0)
-HORA_FIN_OPERACION = time(22, 45)
+ZONA_HORARIA_ATMOS = ZoneInfo("America/Panama")
+HORA_INICIO_OPERACION = time(6, 0)
+HORA_FIN_OPERACION = time(23, 0)
 
 
 @lru_cache(maxsize=1)
@@ -41,9 +43,23 @@ class ServicioPredictor:
     def decidir_atmos(self, datos: dict) -> dict:
         sala_id = datos.pop("sala_id", None)
         nodo_id = datos.pop("nodo_id", None)
+        pabellon = datos.pop("pabellon", None)
+        aire = datos.pop("aire", None)
+        horario = self.obtener_estado_horario_operacion()
+        if not horario["dentro_horario"]:
+            return self.respuesta_fuera_horario(horario)
+
         if datos.get("temp_ac") is None and datos.get("temperatura_salida_aire") is not None:
             datos["temp_ac"] = datos["temperatura_salida_aire"]
         datos.pop("temperatura_salida_aire", None)
+
+        estado_control = self.obtener_estado_control_registro(
+            sala_id=sala_id,
+            nodo_id=nodo_id,
+            pabellon=pabellon,
+            aire=aire,
+        )
+        self.completar_datos_control_atmos(datos, estado_control)
 
         if datos.get("presencia") == 1:
             datos["minutos_sin_presencia"] = 0
@@ -55,11 +71,24 @@ class ServicioPredictor:
         modelo = cargar_modelo_atmos()
         resultado = ejecutar_atmos(modelo, **datos)
         resultado["modelo_ml"] = self.construir_trazabilidad_modelo(resultado, datos)
+        self.persistir_estado_control_registro(
+            sala_id=sala_id,
+            nodo_id=nodo_id,
+            pabellon=pabellon,
+            aire=aire,
+            resultado=resultado,
+            datos_atmos=datos,
+            estado_anterior=estado_control,
+        )
         return resultado
 
     def decidir_atmos_desde_firebase(
         self, area: str = "robotica", aire: str = "Aire_1"
     ) -> dict:
+        horario = self.obtener_estado_horario_operacion()
+        if not horario["dentro_horario"]:
+            return self.respuesta_fuera_horario(horario)
+
         firebase_db = obtener_firebase()
         seleccion = self.obtener_ultima_lectura_firebase(firebase_db, area, aire)
         if not seleccion["valida"]:
@@ -96,27 +125,27 @@ class ServicioPredictor:
 
         lectura = seleccion["lectura"]
         datos_atmos = self.preparar_lectura_firebase(lectura)
+        datos_atmos["pabellon"] = area
+        datos_atmos["aire"] = aire
         if datos_atmos.get("presencia") == 0:
             datos_atmos["minutos_sin_presencia"] = self.calcular_minutos_sin_presencia(
                 pabellon=area,
                 aire=aire,
             ) or 0
-        horario = self.obtener_estado_horario_operacion()
-
-        if horario["dentro_horario"]:
-            resultado = self.decidir_atmos(datos_atmos)
-            accion = (
-                self.traducir_accion_esp32(resultado)
-                if resultado.get("valido")
-                else "mantener"
-            )
-        else:
-            resultado = None
-            accion = "apagar"
+        resultado = self.decidir_atmos(datos_atmos)
+        accion = (
+            self.traducir_accion_esp32(resultado)
+            if resultado.get("valido") and resultado.get("procesado", True)
+            else "mantener"
+        )
 
         firebase_db.child("Atmos").child("comandos").child(area).child(aire).update({
             "accion": accion,
         })
+        if resultado and resultado.get("control"):
+            resultado["control"]["accion_enviada"] = bool(
+                resultado["control"].get("ejecutar_ir") and accion != "mantener"
+            )
         actualizacion_supabase = self.guardar_decision_en_registro(
             pabellon=area,
             aire=aire,
@@ -160,6 +189,149 @@ class ServicioPredictor:
             "actualizacion_supabase": actualizacion_supabase,
             "prediccion_guardada": prediccion_guardada,
         }
+
+    def obtener_estado_control_registro(
+        self,
+        sala_id: UUID | str | None = None,
+        nodo_id: UUID | str | None = None,
+        pabellon: str | None = None,
+        aire: str | None = None,
+    ) -> dict:
+        cliente = obtener_cliente()
+        columnas = (
+            "id,fecha_sync,recomendacion_local,ultima_accion_ejecutada,"
+            "ultima_accion_ir,ciclo_enfriamiento_temp_inicio,ciclo_enfriamiento_inicio"
+        )
+        consulta = (
+            cliente.table("registros")
+            .select(columnas)
+            .order("fecha_sync", desc=True)
+            .limit(1)
+        )
+        if sala_id:
+            consulta = consulta.eq("sala_id", str(sala_id))
+        if nodo_id:
+            consulta = consulta.eq("nodo_id", str(nodo_id))
+        if pabellon:
+            consulta = consulta.eq("pabellon", pabellon)
+        if aire:
+            consulta = consulta.eq("aire", aire)
+
+        try:
+            respuesta = consulta.execute()
+        except Exception as error:
+            log.warning({
+                "evento": "estado_control_atmos_no_disponible",
+                "motivo": "No se pudo leer estado persistente de control; se continua sin memoria previa.",
+                "error": str(error),
+                "sala_id": str(sala_id) if sala_id else None,
+                "nodo_id": str(nodo_id) if nodo_id else None,
+                "pabellon": pabellon,
+                "aire": aire,
+            })
+            return {}
+
+        return respuesta.data[0] if respuesta.data else {}
+
+    def completar_datos_control_atmos(self, datos: dict, estado_control: dict | None) -> None:
+        estado_control = estado_control or {}
+        datos.setdefault("modo_control", "experimental")
+        if datos.get("ultima_accion_ir") is None and estado_control.get("ultima_accion_ir"):
+            datos["ultima_accion_ir"] = estado_control["ultima_accion_ir"]
+
+        inicio_raw = estado_control.get("ciclo_enfriamiento_inicio")
+        temp_inicio = estado_control.get("ciclo_enfriamiento_temp_inicio")
+        if inicio_raw and temp_inicio is not None:
+            try:
+                inicio = datetime.fromisoformat(str(inicio_raw).replace("Z", "+00:00"))
+                if inicio.tzinfo is None:
+                    inicio = inicio.replace(tzinfo=timezone.utc)
+                datos["minutos_enfriando"] = max(
+                    0,
+                    int((datetime.now(timezone.utc) - inicio.astimezone(timezone.utc)).total_seconds() // 60),
+                )
+                if datos.get("temp_inicio") is None:
+                    datos["temp_inicio"] = float(temp_inicio)
+                if datos.get("temp_actual") is None:
+                    datos["temp_actual"] = datos.get("temp_ambiente")
+                if datos.get("temp_ac_actual") is None:
+                    datos["temp_ac_actual"] = datos.get("temp_ac")
+            except (TypeError, ValueError) as error:
+                log.warning({
+                    "evento": "estado_control_atmos_ciclo_invalido",
+                    "motivo": "No se pudo interpretar ciclo_enfriamiento persistido; se continua sin ciclo previo.",
+                    "error": str(error),
+                    "ciclo_enfriamiento_inicio": inicio_raw,
+                    "ciclo_enfriamiento_temp_inicio": temp_inicio,
+                })
+
+    def persistir_estado_control_registro(
+        self,
+        sala_id: UUID | str | None,
+        nodo_id: UUID | str | None,
+        pabellon: str | None,
+        aire: str | None,
+        resultado: dict,
+        datos_atmos: dict,
+        estado_anterior: dict | None,
+    ) -> None:
+        if not resultado or not resultado.get("valido"):
+            return
+
+        registro_id = (estado_anterior or {}).get("id")
+        if not registro_id:
+            estado_anterior = self.obtener_estado_control_registro(
+                sala_id=sala_id,
+                nodo_id=nodo_id,
+                pabellon=pabellon,
+                aire=aire,
+            )
+            registro_id = (estado_anterior or {}).get("id")
+        if not registro_id:
+            return
+
+        datos = self.campos_estado_control_atmos(resultado, datos_atmos, estado_anterior or {})
+        if not datos:
+            return
+
+        try:
+            obtener_cliente().table("registros").update(datos).eq("id", registro_id).execute()
+        except Exception as error:
+            log.warning({
+                "evento": "estado_control_atmos_no_persistido",
+                "motivo": "No se pudo guardar estado de control ATMOS; la decision actual ya fue calculada.",
+                "error": str(error),
+                "registro_id": registro_id,
+                "campos": sorted(datos.keys()),
+            })
+
+    def campos_estado_control_atmos(
+        self,
+        resultado: dict | None,
+        datos_atmos: dict,
+        estado_anterior: dict,
+    ) -> dict:
+        control = (resultado or {}).get("control") or {}
+        decision_final = control.get("decision_final")
+        datos: dict = {}
+
+        if control.get("ejecutar_ir") is True and control.get("comando_ir"):
+            datos["ultima_accion_ir"] = control["comando_ir"]
+
+        decision_anterior = (
+            estado_anterior.get("recomendacion_local")
+            or estado_anterior.get("ultima_accion_ejecutada")
+        )
+        ciclo_activo = estado_anterior.get("ciclo_enfriamiento_inicio")
+        if decision_final == "enfriar_fuerte":
+            if decision_anterior != "enfriar_fuerte" or not ciclo_activo:
+                datos["ciclo_enfriamiento_temp_inicio"] = datos_atmos.get("temp_ambiente")
+                datos["ciclo_enfriamiento_inicio"] = datetime.now(timezone.utc).isoformat()
+        elif decision_final:
+            datos["ciclo_enfriamiento_temp_inicio"] = None
+            datos["ciclo_enfriamiento_inicio"] = None
+
+        return datos
 
     def informacion_modelo(self) -> dict:
         try:
@@ -258,26 +430,41 @@ class ServicioPredictor:
         return publicado
 
     def obtener_estado_horario_operacion(self, ahora: datetime | None = None) -> dict:
-        ahora = ahora or datetime.now(ZONA_HORARIA_ATMOS)
-        if ahora.tzinfo is None:
+        if ahora is None:
+            ahora = datetime.now(ZONA_HORARIA_ATMOS)
+        elif ahora.tzinfo is None:
             ahora = ahora.replace(tzinfo=ZONA_HORARIA_ATMOS)
         else:
             ahora = ahora.astimezone(ZONA_HORARIA_ATMOS)
 
         hora_actual = ahora.time().replace(microsecond=0)
-        dentro_horario = HORA_INICIO_OPERACION <= hora_actual < HORA_FIN_OPERACION
+        dentro_horario = dentro_de_horario_operacion(ahora)
 
         return {
             "zona_horaria": "America/Panama",
+            "dia_semana": ahora.weekday(),
             "hora_actual": hora_actual.isoformat(timespec="minutes"),
             "hora_inicio": HORA_INICIO_OPERACION.isoformat(timespec="minutes"),
             "hora_fin": HORA_FIN_OPERACION.isoformat(timespec="minutes"),
+            "dias_operativos": "lunes-sabado",
             "dentro_horario": dentro_horario,
             "motivo": (
-                "Horario permitido para ejecutar el modelo ML."
+                "Horario operativo de ATMOS."
                 if dentro_horario
-                else "Fuera de horario permitido. Se fuerza accion apagar."
+                else "Fuera de horario operativo de ATMOS (L-S 6:00am-11:00pm, hora de Panama)."
             ),
+        }
+
+    def respuesta_fuera_horario(self, horario: dict | None = None) -> dict:
+        horario = horario or self.obtener_estado_horario_operacion()
+        return {
+            "valido": True,
+            "procesado": False,
+            "motivo": (
+                "Fuera de horario operativo de ATMOS (L-S 6:00am-11:00pm, "
+                "hora de Panama). Lectura recibida pero no procesada."
+            ),
+            "horario": horario,
         }
 
     def obtener_ultima_lectura_firebase(self, firebase_db, area: str, aire: str) -> dict:
@@ -395,8 +582,22 @@ class ServicioPredictor:
         }
 
     def traducir_accion_esp32(self, resultado: dict) -> str:
-        decision = resultado["control"]["decision_final"]
-        accion_ac = resultado["control"]["accion_ac"]
+        control = resultado["control"]
+        if control.get("ejecutar_ir") is False:
+            return "mantener"
+
+        comando_ir = control.get("comando_ir")
+        if comando_ir == "APAGAR":
+            return "apagar"
+        if comando_ir == "TEMP_24":
+            return "ahorro_24"
+        if comando_ir == "TEMP_23":
+            return "encender_23"
+        if comando_ir == "TEMP_22":
+            return "encender_22"
+
+        decision = control["decision_final"]
+        accion_ac = control["accion_ac"]
         temperatura_objetivo = accion_ac.get("temperatura_objetivo")
 
         if decision == "apagar":

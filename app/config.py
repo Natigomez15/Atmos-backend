@@ -17,8 +17,13 @@ class Configuracion(BaseSettings):
     FIREBASE_AUTH_DOMAIN: str = ""
     FIREBASE_DATABASE_URL: str = ""
     FIREBASE_STORAGE_BUCKET: str = ""
-    FIREBASE_SYNC_AUTOSTART: bool = False
+    FIREBASE_SYNC_AUTOSTART: bool = True
     FIREBASE_SYNC_INTERVAL_SECONDS: int = 10
+
+    # Dashboard energetico
+    # Baseline validado pre-ATMOS usado para calcular ahorro estimado.
+    DASHBOARD_BASELINE_KWH_DIA: float = 36.0
+    DASHBOARD_TARIFA_USD_KWH: float = 0.17
 
     # VAPID — notificaciones push
     vapid_clave_privada: str = ""

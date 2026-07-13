@@ -355,7 +355,13 @@ def preparar_registro_supabase(
         "delta_t": delta_t,
         "movimiento": _a_entero(valor.get("movimiento")),
         "potencia_w": potencia_w if potencia_w is not None else consumo_estimado["potencia_w"],
-        "energia_kwh": energia_kwh if energia_kwh is not None else consumo_estimado["energia_kwh"],
+        # Algunos nodos envian energia_kwh=0 aunque esten consumiendo potencia.
+        # En ese caso se conserva la estimacion acumulada basada en potencia y tiempo.
+        "energia_kwh": (
+            energia_kwh
+            if energia_kwh is not None and energia_kwh > 0
+            else consumo_estimado["energia_kwh"]
+        ),
         "estado_ocupacion": _a_booleano(
             valor.get("estado_ocupacion", valor.get("presencia", valor.get("ocupado", 0)))
         ),

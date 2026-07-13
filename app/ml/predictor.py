@@ -11,6 +11,7 @@ from app.core.database import obtener_firebase
 from app.core.logger import log
 from app.ml.atmos_logic import dentro_de_horario_operacion, ejecutar_atmos
 from app.ml.impacto import CANTIDAD_AIRES, CONSUMO_AC_KW
+from app.ml.metadata_modelo import construir_panel_modelo
 from app.services.sincronizador_firebase import leer_ultima_lectura_valida_firebase_rest
 
 
@@ -79,6 +80,14 @@ class ServicioPredictor:
             resultado=resultado,
             datos_atmos=datos,
             estado_anterior=estado_control,
+        )
+        self.registrar_evento_decision_atmos(
+            sala_id=sala_id,
+            nodo_id=nodo_id,
+            pabellon=pabellon,
+            aire=aire,
+            resultado=resultado,
+            origen="decidir_atmos",
         )
         return resultado
 
@@ -346,6 +355,15 @@ class ServicioPredictor:
             "version_modelo": VERSION_MODELO_ATMOS,
             "features_requeridas": FEATURES_PUBLICAS_ATMOS,
         }
+
+    def panel_modelo(self) -> dict:
+        """Introspección del modelo para el panel 'Sobre el motor':
+        importancia REAL de variables + métricas de validación persistidas
+        (o su ausencia). No usa la base de datos."""
+        modelo = cargar_modelo_atmos()
+        return construir_panel_modelo(
+            modelo, MODELO_ATMOS_PATH, VERSION_MODELO_ATMOS
+        )
 
     def trazabilidad_modelo_no_usado(
         self,
@@ -764,6 +782,73 @@ class ServicioPredictor:
             **datos,
         }
 
+    def registrar_evento_decision_atmos(
+        self,
+        *,
+        sala_id=None,
+        nodo_id=None,
+        pabellon: str | None = None,
+        aire: str | None = None,
+        resultado: dict | None = None,
+        origen: str = "atmos_logic",
+    ) -> None:
+        if not resultado or not resultado.get("procesado", True):
+            return
+
+        control = resultado.get("control") or {}
+        seguridad = resultado.get("seguridad") or {}
+        fallas = resultado.get("deteccion_fallas") or {}
+        decision_final = control.get("decision_final")
+        if not decision_final:
+            return
+
+        comando_ir = control.get("comando_ir") or control.get("comando_ir_sugerido")
+        tipo = decision_final
+        if fallas.get("estado_falla") == "posible_falla":
+            tipo = "posible_falla_ac"
+        elif decision_final == "apagar":
+            tipo = "apagado_automatico"
+        elif decision_final == "esperar_apagado":
+            tipo = "espera_apagado"
+        elif decision_final == "enfriar_fuerte":
+            tipo = "enfriamiento"
+        elif decision_final == "mantener":
+            tipo = "mantener"
+
+        motivo = (
+            seguridad.get("mensaje")
+            or control.get("motivo_no_ejecucion")
+            or fallas.get("mensaje")
+            or "Decisión generada por atmos_logic"
+        )
+        datos = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "tipo": tipo,
+            "motivo": motivo,
+            "pabellon": pabellon,
+            "aire": aire,
+            "sala_id": str(sala_id) if sala_id else None,
+            "nodo_id": str(nodo_id) if nodo_id else None,
+            "decision_final": decision_final,
+            "comando_ir": comando_ir,
+            "metadata": {
+                "origen": origen,
+                "ejecutar_ir": control.get("ejecutar_ir"),
+                "accion_enviada": control.get("accion_enviada"),
+                "estado_falla": fallas.get("estado_falla"),
+            },
+        }
+        try:
+            obtener_cliente().table("atmos_decision_events").insert(datos).execute()
+        except Exception as error:
+            log.warning({
+                "evento": "atmos_decision_event_no_guardado",
+                "error": str(error),
+                "tipo": tipo,
+                "pabellon": pabellon,
+                "aire": aire,
+            })
+
     def resolver_sala_id_por_pabellon_aire(self, pabellon: str, aire: str) -> str | None:
         cliente = obtener_cliente()
         respuesta = (
@@ -838,6 +923,110 @@ class ServicioPredictor:
             "id": respuesta.data[0].get("id") if respuesta.data else None,
             "sala_id": str(sala_id),
         }
+
+    # -----------------------------------------------------------------------
+    # Aciertos en producción (Fase 2.3)
+    # -----------------------------------------------------------------------
+    #
+    # REGLA DE ACIERTO (documentada):
+    #   Una recomendación de APAGADO (decision_final == "apagar") se considera
+    #   CORRECTA si en la ventana de VENTANA_ACIERTO_MIN minutos posteriores al
+    #   evento NO se registró ocupación (estado_ocupacion = True) en el mismo
+    #   pabellón/aire. Es decir: el sistema apagó y el espacio efectivamente
+    #   siguió vacío. Si hubo ocupación en esa ventana, el apagado fue
+    #   prematuro y cuenta como incorrecto.
+    #
+    #   "Precisión en producción" = correctas / evaluadas de las últimas N
+    #   recomendaciones de apagado con ventana ya vencida.
+    #
+    # Fuente de recomendaciones: tabla atmos_decision_events (log de Fase 2).
+    # Fuente de ocupación posterior: tabla registros (estado_ocupacion).
+    VENTANA_ACIERTO_MIN = 45  # dentro del rango 30-60 min definido en la tarea
+
+    def precision_apagados_produccion(
+        self, limite: int = 100
+    ) -> dict:
+        """Calcula la precisión real de las recomendaciones de apagado contra
+        la ocupación observada después. Ver REGLA DE ACIERTO arriba.
+
+        Devuelve estado="disponible" con el porcentaje, o estado="sin_datos"
+        si aún no hay suficientes eventos con ventana vencida. No lanza
+        excepciones: ante cualquier problema de datos degrada a "pendiente".
+        """
+        cliente = obtener_cliente()
+        ahora = datetime.now(timezone.utc)
+        limite_ventana = (ahora - timedelta(minutes=self.VENTANA_ACIERTO_MIN)).isoformat()
+
+        try:
+            eventos = (
+                cliente.table("atmos_decision_events")
+                .select("timestamp_utc,pabellon,aire,decision_final")
+                .eq("decision_final", "apagar")
+                .lte("timestamp_utc", limite_ventana)
+                .order("timestamp_utc", desc=True)
+                .limit(limite)
+                .execute()
+            ).data or []
+        except Exception as error:
+            log.warning({
+                "evento": "precision_apagados_no_disponible",
+                "error": str(error),
+            })
+            return {
+                "estado": "pendiente",
+                "motivo": "No se pudo leer el log de decisiones (atmos_decision_events).",
+                "ventana_min": self.VENTANA_ACIERTO_MIN,
+            }
+
+        evaluadas = 0
+        correctas = 0
+        for evento in eventos:
+            inicio = self._parsear_fecha(evento.get("timestamp_utc"))
+            if inicio is None:
+                continue
+            fin = inicio + timedelta(minutes=self.VENTANA_ACIERTO_MIN)
+            try:
+                ocupacion = (
+                    cliente.table("registros")
+                    .select("id")
+                    .eq("pabellon", evento.get("pabellon"))
+                    .eq("aire", evento.get("aire"))
+                    .eq("estado_ocupacion", True)
+                    .gte("fecha_sync", inicio.isoformat())
+                    .lte("fecha_sync", fin.isoformat())
+                    .limit(1)
+                    .execute()
+                ).data or []
+            except Exception:
+                continue
+            evaluadas += 1
+            if not ocupacion:  # no hubo ocupación → apagado correcto
+                correctas += 1
+
+        if evaluadas == 0:
+            return {
+                "estado": "sin_datos",
+                "motivo": "Aún no hay recomendaciones de apagado con ventana vencida para evaluar.",
+                "ventana_min": self.VENTANA_ACIERTO_MIN,
+            }
+
+        return {
+            "estado": "disponible",
+            "evaluadas": evaluadas,
+            "correctas": correctas,
+            "precision_pct": round(correctas / evaluadas * 100, 1),
+            "ventana_min": self.VENTANA_ACIERTO_MIN,
+        }
+
+    @staticmethod
+    def _parsear_fecha(valor) -> datetime | None:
+        if not valor:
+            return None
+        try:
+            fecha = datetime.fromisoformat(str(valor).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return fecha if fecha.tzinfo else fecha.replace(tzinfo=timezone.utc)
 
     # -----------------------------------------------------------------------
     # Características de entrenamiento

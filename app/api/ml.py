@@ -70,7 +70,20 @@ def _mapear_prediccion(prediccion: dict) -> dict:
         "accion_final": instantanea.get("accion_final"),
         "motivo_reglas_seguridad": instantanea.get("motivo_reglas_seguridad"),
     }
+    # Confianza de la predicción (RandomForest.predict_proba): probabilidad de
+    # la clase elegida. Se expone lista para el frontend ("Apagar aire —
+    # confianza 87%").
+    confianza = prediccion.get("puntaje_confianza")
+    confianza_pct = round(float(confianza) * 100) if confianza is not None else None
+    texto_accion = _texto_accion(instantanea.get("accion_final"))
+    recomendacion_texto = (
+        f"{texto_accion} — confianza {confianza_pct}%"
+        if confianza_pct is not None
+        else texto_accion
+    )
     return {
+        "confianza_pct": confianza_pct,
+        "recomendacion_texto": recomendacion_texto,
         **prediccion,
         "room_id": prediccion.get("sala_id"),
         "recommended_setpoint": prediccion.get("setpoint_recomendado"),
@@ -399,3 +412,27 @@ async def impacto_decisiones(
 @enrutador.get("/impacto/real")
 async def impacto_real():
     return resumir_impacto_real()
+
+
+@enrutador.get("/modelo/info")
+async def informacion_modelo():
+    """Panel 'Sobre el motor': tipo de modelo, clases, importancia REAL de
+    variables (feature_importances_ del RandomForest) y métricas de
+    validación persistidas. Si el modelo activo no tiene metadata de
+    métricas, `metricas_disponibles` es False y el frontend muestra
+    'No disponible para esta versión'."""
+    servicio = ServicioPredictor()
+    try:
+        panel = servicio.panel_modelo()
+    except Exception as error:
+        raise HTTPException(
+            status_code=503,
+            detail=f"No se pudo introspeccionar el modelo: {error}",
+        )
+    # Aciertos en producción (Fase 2.3): degrada a estado "pendiente"/"sin_datos"
+    # sin romper el panel si el log de decisiones aún no tiene datos evaluables.
+    try:
+        panel["aciertos_produccion"] = servicio.precision_apagados_produccion()
+    except Exception:
+        panel["aciertos_produccion"] = {"estado": "pendiente"}
+    return panel

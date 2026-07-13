@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
 from uuid import UUID
 
@@ -15,6 +15,7 @@ from app.ml.impacto import TARIFA_KWH
 from app.models.schemas import SalaActualizar, SalaCrear
 from app.api.ac_commands import comando_desde_prediccion
 from app.services.alert_service import ServicioAlertas
+from app.services.dashboard_energy import construir_resumen_dashboard, rango_dashboard, ahora_panama
 from app.services.sincronizador_firebase import leer_ultima_lectura_valida_firebase_rest
 from app.core.aires import es_aire_ignorado
 
@@ -54,6 +55,8 @@ def _mapear_sala(sala: dict) -> dict:
         "floor": sala.get("piso"),
         "capacity": sala.get("capacidad"),
         "aires": sala.get("aires") or [],
+        "tipo": sala.get("tipo", "laboratorio"),
+        "activo": sala.get("activo", True),
     }
 
 
@@ -68,6 +71,39 @@ def _resolver_pabellon_y_aire(sala: dict, aire_param: Optional[str] = None) -> t
         # legado: nombre del salón era el nombre del aire
         aire = sala.get("nombre")
     return pabellon, aire
+
+
+def _inicializar_comando_sala_firebase(sala: dict) -> None:
+    pabellon, aire = _resolver_pabellon_y_aire(sala)
+    if not pabellon or not aire:
+        log.warning({
+            "evento": "room_firebase_comando_no_inicializado",
+            "motivo": "No se pudo resolver pabellon/aire para inicializar comandos.",
+            "sala_id": str(sala.get("id")),
+            "pabellon": pabellon,
+            "aire": aire,
+        })
+        return
+
+    try:
+        firebase_db = obtener_firebase()
+        firebase_db.child("Atmos").child("comandos").child(pabellon).child(aire).update({
+            "accion": "mantener",
+        })
+        log.info({
+            "evento": "room_firebase_comando_inicializado",
+            "sala_id": str(sala.get("id")),
+            "ruta": f"/Atmos/comandos/{pabellon}/{aire}/accion",
+            "accion": "mantener",
+        })
+    except Exception as error:
+        log.warning({
+            "evento": "room_firebase_comando_error",
+            "sala_id": str(sala.get("id")),
+            "pabellon": pabellon,
+            "aire": aire,
+            "error": str(error),
+        })
 
 
 def _valor_ac_encendido_reporte(registro: dict):
@@ -352,10 +388,13 @@ def _escribir_accion_manual_en_firebase(
 
 
 @enrutador.get("/rooms")
-async def listar_rooms():
+async def listar_rooms(incluir_inactivos: bool = False):
     try:
         cliente = obtener_cliente()
-        respuesta = cliente.table("rooms").select("*").order("nombre", desc=False).execute()
+        consulta = cliente.table("rooms").select("*")
+        if not incluir_inactivos:
+            consulta = consulta.eq("activo", True)
+        respuesta = consulta.order("nombre", desc=False).execute()
         return [_mapear_sala(sala) for sala in respuesta.data or []]
     except Exception as error:
         raise HTTPException(
@@ -367,10 +406,12 @@ async def listar_rooms():
 @enrutador.post("/rooms", status_code=201)
 async def crear_room(sala: SalaCrear):
     cliente = obtener_cliente()
-    respuesta = cliente.table("rooms").insert(sala.model_dump()).execute()
+    respuesta = cliente.table("rooms").insert(sala.model_dump(exclude_none=True)).execute()
     if not respuesta.data:
         raise HTTPException(status_code=400, detail="Error al insertar la sala")
-    return _mapear_sala(respuesta.data[0])
+    sala_creada = respuesta.data[0]
+    _inicializar_comando_sala_firebase(sala_creada)
+    return _mapear_sala(sala_creada)
 
 
 @enrutador.get("/rooms/{sala_id}")
@@ -393,12 +434,26 @@ async def actualizar_room(sala_id: UUID, cambios: SalaActualizar):
     cliente = obtener_cliente()
     datos = {
         campo: valor
-        for campo, valor in cambios.model_dump().items()
+        for campo, valor in cambios.model_dump(exclude_unset=True).items()
         if valor is not None
     }
     if not datos:
         raise HTTPException(status_code=400, detail="No se proporcionaron cambios")
     respuesta = cliente.table("rooms").update(datos).eq("id", str(sala_id)).execute()
+    if not respuesta.data:
+        raise HTTPException(status_code=404, detail="Sala no encontrada")
+    return _mapear_sala(respuesta.data[0])
+
+
+@enrutador.delete("/rooms/{sala_id}")
+async def eliminar_room(sala_id: UUID):
+    cliente = obtener_cliente()
+    respuesta = (
+        cliente.table("rooms")
+        .update({"activo": False})
+        .eq("id", str(sala_id))
+        .execute()
+    )
     if not respuesta.data:
         raise HTTPException(status_code=404, detail="Sala no encontrada")
     return _mapear_sala(respuesta.data[0])
@@ -641,6 +696,94 @@ async def resumen_pabellon(period_days: int = 1):
         "total_savings_usd": 0,
         "avg_savings_pct": 0,
         "rooms_count": 0,
+    }
+
+
+@enrutador.get("/dashboard/energy")
+async def dashboard_energia(range: Annotated[str, Query(alias="range")] = "24h"):
+    clave_rango, config_rango = rango_dashboard(range)
+    fin_local = ahora_panama()
+    inicio_hoy_local = fin_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    dias_consulta = max(config_rango.dias, 30)
+    inicio_rango_local = fin_local - timedelta(days=dias_consulta)
+    inicio_semana_local = inicio_hoy_local - timedelta(days=7)
+    desde_iso = min(inicio_rango_local, inicio_semana_local).astimezone(timezone.utc).isoformat()
+
+    respuesta = (
+        obtener_cliente()
+        .table("registros")
+        .select(
+            "fecha_sync,potencia_w,energia_kwh,estado_ocupacion,"
+            "aire_encendido_atmos,pabellon,aire"
+        )
+        .gte("fecha_sync", desde_iso)
+        # El volumen puede superar 10,000 filas en 30 dias. Se solicitan las
+        # mas recientes para que el limite no deje fuera las lecturas de hoy;
+        # el servicio de dashboard las ordena cronologicamente despues.
+        .order("fecha_sync", desc=True)
+        .limit(10000)
+        .execute()
+    )
+    filas = [
+        fila
+        for fila in (respuesta.data or [])
+        if not es_aire_ignorado(fila.get("aire"))
+    ]
+    resumen = construir_resumen_dashboard(filas, clave_rango)
+    resumen["phase2"]["activity"] = _obtener_actividad_sistema_dashboard()
+    resumen["source"] = "registros"
+    return resumen
+
+
+def _obtener_actividad_sistema_dashboard() -> dict:
+    cliente = obtener_cliente()
+    desde_iso = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    try:
+        respuesta = (
+            cliente.table("atmos_decision_events")
+            .select("*")
+            .gte("timestamp_utc", desde_iso)
+            .order("timestamp_utc", desc=True)
+            .limit(300)
+            .execute()
+        )
+    except Exception as error:
+        log.warning({
+            "evento": "dashboard_decision_events_no_disponible",
+            "error": str(error),
+        })
+        return {
+            "events": [],
+            "counts": [],
+            "table_available": False,
+            "empty_message": "Sin eventos registrados todavía",
+        }
+
+    eventos = respuesta.data or []
+    conteos: dict[str, int] = {}
+    for evento in eventos:
+        tipo = evento.get("tipo") or "sin_tipo"
+        conteos[tipo] = conteos.get(tipo, 0) + 1
+
+    return {
+        "events": [
+            {
+                "id": evento.get("id"),
+                "timestamp_utc": evento.get("timestamp_utc"),
+                "tipo": evento.get("tipo"),
+                "motivo": evento.get("motivo"),
+                "pabellon": evento.get("pabellon"),
+                "aire": evento.get("aire"),
+                "decision_final": evento.get("decision_final"),
+            }
+            for evento in eventos[:10]
+        ],
+        "counts": [
+            {"tipo": tipo, "count": cantidad}
+            for tipo, cantidad in sorted(conteos.items(), key=lambda item: item[1], reverse=True)
+        ],
+        "table_available": True,
+        "empty_message": "Sin eventos registrados todavía",
     }
 
 

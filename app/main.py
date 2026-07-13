@@ -63,11 +63,36 @@ async def iniciar_sincronizacion_firebase():
     async def bucle_sincronizacion():
         while True:
             try:
-                resultado = await asyncio.to_thread(
-                    sincronizar_firebase_supabase,
-                    None,
-                    None,
+                cliente = obtener_cliente()
+                respuesta_salas = await asyncio.to_thread(
+                    lambda: cliente.table("rooms")
+                    .select("nombre,pabellon,edificio,aires,activo")
+                    .eq("activo", True)
+                    .execute()
                 )
+                objetivos: set[tuple[str, str]] = set()
+                for sala in respuesta_salas.data or []:
+                    pabellon = sala.get("pabellon") or sala.get("edificio")
+                    aires = sala.get("aires") or []
+                    if not aires and str(sala.get("nombre") or "").lower().startswith("aire_"):
+                        aires = [sala["nombre"]]
+                    for aire in aires:
+                        if pabellon and aire:
+                            objetivos.add((str(pabellon), str(aire)))
+
+                resultados = []
+                for pabellon, aire in sorted(objetivos):
+                    resultados.append(await asyncio.to_thread(
+                        sincronizar_firebase_supabase,
+                        pabellon,
+                        aire,
+                    ))
+                resultado = {
+                    "objetivos": len(objetivos),
+                    "sincronizados": sum(r.get("sincronizados", 0) for r in resultados),
+                    "errores": sum(r.get("errores", 0) for r in resultados),
+                    "resultados": resultados,
+                }
                 log.info({
                     "evento": "sincronizacion_firebase_periodica",
                     "resultado": resultado,

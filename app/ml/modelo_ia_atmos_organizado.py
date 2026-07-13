@@ -298,6 +298,48 @@ joblib.dump(modelo_v2, "modelo_atmos.pkl")
 
 print("Modelo ATMOS exportado correctamente como modelo_atmos.pkl")
 
+# ==========================================
+# PERSISTENCIA DE MÉTRICAS DE VALIDACIÓN (metadata del modelo)
+# ==========================================
+# Se guardan las métricas de validación calculadas sobre el conjunto de prueba
+# junto al modelo, en un JSON de metadata que el backend expone en el panel
+# "Sobre el motor". Sin esto, el frontend muestra
+# "No disponible para esta versión". El nombre del JSON debe coincidir con
+# el que lee app/ml/metadata_modelo.py (modelo_atmos_metadata.json).
+
+import json
+from datetime import datetime, timezone
+from sklearn.metrics import precision_recall_fscore_support
+
+_precision_w, _recall_w, _f1_w, _ = precision_recall_fscore_support(
+    y_test2, predicciones2, average="weighted", zero_division=0
+)
+
+metadata_modelo = {
+    "version": "modelo_atmos_rf_v1",
+    "tipo_modelo": type(modelo_v2).__name__,
+    "fecha_entrenamiento": datetime.now(timezone.utc).isoformat(),
+    "n_muestras": int(len(df_total)),
+    "n_muestras_entrenamiento": int(len(X_train2)),
+    "n_muestras_validacion": int(len(X_test2)),
+    "features": list(X_total.columns),
+    "clases": list(modelo_v2.classes_),
+    "accuracy": round(float(precision2), 4),
+    "precision": round(float(_precision_w), 4),
+    "recall": round(float(_recall_w), 4),
+    "f1": round(float(_f1_w), 4),
+    "importancia_variables": {
+        variable: round(float(peso), 4)
+        for variable, peso in zip(X_total.columns, modelo_v2.feature_importances_)
+    },
+}
+
+with open("modelo_atmos_metadata.json", "w", encoding="utf-8") as _archivo:
+    json.dump(metadata_modelo, _archivo, ensure_ascii=False, indent=2)
+
+print("Metadata de validación exportada como modelo_atmos_metadata.json")
+print(json.dumps(metadata_modelo, ensure_ascii=False, indent=2))
+
 #from google.colab import files
 
 #files.download("modelo_atmos.pkl")

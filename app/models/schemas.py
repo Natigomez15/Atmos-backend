@@ -1,4 +1,4 @@
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 from datetime import datetime
 from typing import Optional, Literal, List
 from uuid import UUID
@@ -41,25 +41,33 @@ class RegistroRespuesta(RegistroCrear):
 # ---------------------------------------------------------------------------
 
 class SalaCrear(BaseModel):
-    nombre: str
-    pabellon: Optional[str] = None
-    capacidad: Optional[int] = None
+    model_config = ConfigDict(populate_by_name=True)
+
+    nombre: str = Field(validation_alias=AliasChoices("nombre", "name"))
+    pabellon: Optional[str] = Field(default=None, validation_alias=AliasChoices("pabellon", "pavilion", "edificio"))
+    capacidad: Optional[int] = Field(default=None, validation_alias=AliasChoices("capacidad", "capacity"))
     area_m2: Optional[float] = None
     piso: Optional[int] = None
-    marca_ac: Optional[str] = None
-    modelo_ac: Optional[str] = None
+    marca_ac: Optional[str] = Field(default=None, validation_alias=AliasChoices("marca_ac", "ac_brand"))
+    modelo_ac: Optional[str] = Field(default=None, validation_alias=AliasChoices("modelo_ac", "ac_model"))
     aires: Optional[List[str]] = Field(default_factory=list)
+    tipo: Literal["laboratorio", "oficina", "salon"] = "laboratorio"
+    activo: bool = True
 
 
 class SalaActualizar(BaseModel):
-    nombre: Optional[str] = None
-    pabellon: Optional[str] = None
-    capacidad: Optional[int] = None
+    model_config = ConfigDict(populate_by_name=True)
+
+    nombre: Optional[str] = Field(default=None, validation_alias=AliasChoices("nombre", "name"))
+    pabellon: Optional[str] = Field(default=None, validation_alias=AliasChoices("pabellon", "pavilion", "edificio"))
+    capacidad: Optional[int] = Field(default=None, validation_alias=AliasChoices("capacidad", "capacity"))
     area_m2: Optional[float] = None
     piso: Optional[int] = None
-    marca_ac: Optional[str] = None
-    modelo_ac: Optional[str] = None
+    marca_ac: Optional[str] = Field(default=None, validation_alias=AliasChoices("marca_ac", "ac_brand"))
+    modelo_ac: Optional[str] = Field(default=None, validation_alias=AliasChoices("modelo_ac", "ac_model"))
     aires: Optional[List[str]] = None
+    tipo: Optional[Literal["laboratorio", "oficina", "salon"]] = None
+    activo: Optional[bool] = None
 
 
 class SalaRespuesta(SalaCrear):

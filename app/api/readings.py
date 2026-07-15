@@ -16,6 +16,7 @@ from app.core.websocket_manager import gestor
 from app.services.aggregation import agregar_lecturas, ServicioAgregacion
 from app.services.alert_service import ServicioAlertas
 from app.services.sincronizador_firebase import (
+    aplicar_estado_comando_firebase,
     sincronizar_firebase_supabase,
     leer_ultimas_lecturas_firebase_rest,
     leer_ultima_lectura_valida_firebase_rest,
@@ -175,11 +176,12 @@ def _obtener_lectura_firebase_directa(pabellon: str, aire: str, sala_id: str | N
 
     firebase_key = seleccion.get("firebase_key") or "directo"
     try:
+        valor = aplicar_estado_comando_firebase(seleccion["lectura"], pabellon, aire)
         return preparar_registro_supabase(
             pabellon=pabellon,
             aire=aire,
             firebase_key=firebase_key,
-            valor=seleccion["lectura"],
+            valor=valor,
             sala_id=sala_id,
             nodo_id=nodo_id,
             registro_anterior=None,

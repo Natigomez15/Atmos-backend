@@ -101,6 +101,9 @@ def preparar_registros(filas: list[dict]) -> list[dict]:
             "_fecha": fecha,
             "_potencia_w": a_float(fila.get("potencia_w")),
             "_energia_kwh": a_float(fila.get("energia_kwh")),
+            "_consumo_intervalo_kwh": a_float(fila.get("consumo_intervalo_kwh")),
+            "_tarifa_kwh": a_float(fila.get("tarifa_kwh")),
+            "_costo_intervalo": a_float(fila.get("costo_intervalo")),
             "_ocupado": a_bool(fila.get("estado_ocupacion")),
             "_ac_encendido": a_bool(
                 fila.get("aire_encendido_atmos")
@@ -145,14 +148,17 @@ def iterar_intervalos(registros: list[dict]):
         fin = actual["_fecha"]
         if fin <= inicio:
             continue
-        potencia_w = anterior["_potencia_w"]
-        if potencia_w is None:
-            continue
         segundos = min((fin - inicio).total_seconds(), MAX_INTERVALO_INTEGRACION_MIN * 60)
         if segundos <= 0:
             continue
         horas = segundos / 3600
-        yield anterior, inicio, horas, potencia_w * horas / 1000
+        consumo_medido = actual["_consumo_intervalo_kwh"]
+        if consumo_medido is not None:
+            yield anterior, inicio, horas, max(0.0, consumo_medido)
+            continue
+        potencia_w = anterior["_potencia_w"]
+        if potencia_w is not None:
+            yield anterior, inicio, horas, potencia_w * horas / 1000
 
 
 def energia_por_acumulado(registros: list[dict]) -> float | None:
@@ -347,7 +353,12 @@ def construir_resumen_dashboard(filas: list[dict], rango: str | None = "24h") ->
     puntos = construir_puntos(registros, config=config, inicio_periodo=inicio_periodo, fin_periodo=fin_utc)
     metricas = integrar_metricas(registros, inicio_periodo=inicio_periodo, fin_periodo=fin_utc)
 
-    tarifa = configuracion.DASHBOARD_TARIFA_USD_KWH
+    tarifas_medidas = [
+        registro["_tarifa_kwh"]
+        for registro in registros
+        if registro.get("_tarifa_kwh") is not None
+    ]
+    tarifa = tarifas_medidas[-1] if tarifas_medidas else configuracion.DASHBOARD_TARIFA_USD_KWH
     baseline_dia = configuracion.DASHBOARD_BASELINE_KWH_DIA
     baseline_periodo = baseline_dia * config.dias
     ahorro_estimado = (baseline_periodo - metricas["periodo_kwh"]) * tarifa

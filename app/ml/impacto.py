@@ -1,6 +1,8 @@
 from datetime import datetime, timezone
 from typing import Any
 
+from app.config import configuracion
+
 
 CONSUMO_AC_KW = 1.5
 TARIFA_KWH = 0.18
@@ -54,6 +56,52 @@ def _a_bool(valor: Any) -> bool | None:
     return None
 
 
+def _numero_opcional(valor: Any) -> float | None:
+    if valor is None or valor == "":
+        return None
+    try:
+        return float(valor)
+    except (TypeError, ValueError):
+        return None
+
+
+def obtener_medicion_electrica_firebase(valor: dict[str, Any]) -> dict[str, float | None]:
+    """Normaliza la telemetría eléctrica calculada por el ESP32.
+
+    La potencia activa medida tiene prioridad sobre cualquier estimación fija.
+    ``potencia_aparente_va`` se conserva aparte: no se usa como watts porque
+    incluye potencia reactiva y no equivale a consumo activo.
+    """
+    potencia_activa_w = _numero_opcional(
+        valor.get("potencia_activa_w", valor.get("potencia_w", valor.get("power_w")))
+    )
+    potencia_activa_kw = _numero_opcional(valor.get("potencia_activa_kw"))
+    if potencia_activa_w is None and potencia_activa_kw is not None:
+        potencia_activa_w = potencia_activa_kw * 1000
+
+    return {
+        "corriente_rms": _numero_opcional(
+            valor.get("corriente_rms", valor.get("corriente_a"))
+        ),
+        "voltaje_red_v": _numero_opcional(valor.get("voltaje_red_v")),
+        "factor_potencia": _numero_opcional(valor.get("factor_potencia")),
+        "potencia_aparente_va": _numero_opcional(valor.get("potencia_aparente_va")),
+        "potencia_activa_w": potencia_activa_w,
+        "potencia_activa_kw": (
+            potencia_activa_kw
+            if potencia_activa_kw is not None
+            else potencia_activa_w / 1000 if potencia_activa_w is not None else None
+        ),
+        "consumo_intervalo_kwh": _numero_opcional(valor.get("consumo_intervalo_kwh")),
+        "consumo_acumulado_sesion_kwh": _numero_opcional(
+            valor.get("consumo_acumulado_sesion_kwh")
+        ),
+        "tarifa_kwh": _numero_opcional(valor.get("tarifa_kwh")),
+        "costo_intervalo": _numero_opcional(valor.get("costo_intervalo")),
+        "costo_acumulado_sesion": _numero_opcional(valor.get("costo_acumulado_sesion")),
+    }
+
+
 def _fecha(valor: Any) -> datetime | None:
     if not valor:
         return None
@@ -80,6 +128,18 @@ def inferir_accion(valor: dict[str, Any]) -> str:
 
 
 def inferir_ac_encendido(valor: dict[str, Any], registro_anterior: dict[str, Any] | None = None) -> bool:
+    # La potencia activa es evidencia física y tiene prioridad sobre el comando
+    # solicitado. Se usa histéresis para ignorar ruido o consumo de standby.
+    medicion = obtener_medicion_electrica_firebase(valor)
+    potencia_activa_w = medicion["potencia_activa_w"]
+    if potencia_activa_w is not None:
+        if potencia_activa_w >= configuracion.AC_POWER_ON_THRESHOLD_W:
+            return True
+        if potencia_activa_w <= configuracion.AC_POWER_OFF_THRESHOLD_W:
+            return False
+        if registro_anterior and registro_anterior.get("aire_encendido_atmos") is not None:
+            return bool(registro_anterior["aire_encendido_atmos"])
+
     estado_explicito = _a_bool(
         valor.get("aire_encendido_atmos", valor.get("ac_encendido", valor.get("estado_ac")))
     )
@@ -93,7 +153,7 @@ def inferir_ac_encendido(valor: dict[str, Any], registro_anterior: dict[str, Any
         return True
 
     if registro_anterior and registro_anterior.get("potencia_w") is not None:
-        return float(registro_anterior["potencia_w"]) > 0
+        return float(registro_anterior["potencia_w"]) >= configuracion.AC_POWER_ON_THRESHOLD_W
 
     return False
 
@@ -104,7 +164,13 @@ def estimar_consumo_registro(
     fecha_actual: datetime,
 ) -> dict[str, float]:
     ac_encendido = inferir_ac_encendido(valor, registro_anterior)
-    potencia_w = CONSUMO_AC_KW * CANTIDAD_AIRES * 1000 if ac_encendido else 0.0
+    medicion = obtener_medicion_electrica_firebase(valor)
+    potencia_medida_w = medicion["potencia_activa_w"]
+    potencia_w = (
+        potencia_medida_w
+        if potencia_medida_w is not None
+        else CONSUMO_AC_KW * CANTIDAD_AIRES * 1000 if ac_encendido else 0.0
+    )
 
     energia_anterior = 0.0
     if registro_anterior and registro_anterior.get("energia_kwh") is not None:
@@ -118,8 +184,17 @@ def estimar_consumo_registro(
             (fecha_actual - fecha_anterior.astimezone(fecha_actual.tzinfo)).total_seconds() / 3600,
         )
 
-    energia_kwh = energia_anterior + (potencia_w / 1000) * horas_transcurridas
-    costo_estimado = energia_kwh * TARIFA_KWH
+    consumo_intervalo = medicion["consumo_intervalo_kwh"]
+    if consumo_intervalo is not None:
+        # El acumulado de sesión puede volver a cero cuando el aire reinicia.
+        # Sumando intervalos al acumulado del backend se mantiene una serie
+        # monótona útil para el dashboard aunque cambie la sesión eléctrica.
+        energia_kwh = energia_anterior + max(0.0, consumo_intervalo)
+    else:
+        energia_kwh = energia_anterior + (potencia_w / 1000) * horas_transcurridas
+
+    tarifa = medicion["tarifa_kwh"] if medicion["tarifa_kwh"] is not None else TARIFA_KWH
+    costo_estimado = energia_kwh * tarifa
 
     return {
         "potencia_w": round(potencia_w, 2),

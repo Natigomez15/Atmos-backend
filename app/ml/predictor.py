@@ -10,7 +10,6 @@ from app.core.database import obtener_cliente
 from app.core.database import obtener_firebase
 from app.core.logger import log
 from app.ml.atmos_logic import dentro_de_horario_operacion, ejecutar_atmos
-from app.ml.impacto import CANTIDAD_AIRES, CONSUMO_AC_KW
 from app.ml.metadata_modelo import construir_panel_modelo
 from app.services.sincronizador_firebase import leer_ultima_lectura_valida_firebase_rest
 
@@ -28,6 +27,13 @@ FEATURES_PUBLICAS_ATMOS = [
 ZONA_HORARIA_ATMOS = ZoneInfo("America/Panama")
 HORA_INICIO_OPERACION = time(6, 0)
 HORA_FIN_OPERACION = time(23, 0)
+ACCIONES_IR_RECONOCIDAS = {
+    "apagar",
+    "ahorro_24",
+    "encender_22",
+    "encender_23",
+    "enfriar_fuerte",
+}
 
 
 @lru_cache(maxsize=1)
@@ -36,6 +42,126 @@ def cargar_modelo_atmos():
 
 
 class ServicioPredictor:
+    @staticmethod
+    def normalizar_accion_comando(accion: str | None) -> str:
+        return str(accion or "").strip().lower().replace(" ", "_").replace("-", "_")
+
+    def comando_desde_firma_ejecutada(self, firma: str | None) -> dict | None:
+        texto = str(firma or "")
+        separador = "|actualizado_en:"
+        if not texto.startswith("accion:") or separador not in texto:
+            return None
+        accion, actualizado_en = texto.removeprefix("accion:").split(separador, 1)
+        accion = self.normalizar_accion_comando(accion)
+        if accion not in ACCIONES_IR_RECONOCIDAS or not actualizado_en:
+            return None
+        return {"accion": accion, "actualizado_en": actualizado_en}
+
+    def publicar_comando_si_cambio(
+        self,
+        firebase_db,
+        area: str,
+        aire: str,
+        accion: str,
+        metadata: dict | None = None,
+        permitir_publicacion: bool = True,
+    ) -> dict:
+        """Publica un comando únicamente cuando cambia la acción efectiva.
+
+        El ESP32 deduplica usando ``accion`` + ``actualizado_en``. Reescribir
+        la misma acción con una fecha nueva provoca otro envío IR, aunque el
+        equipo ya esté en ese modo.
+        """
+        referencia = (
+            firebase_db.child("Atmos").child("comandos").child(area).child(aire)
+        )
+        comando_actual = referencia.get().val() or {}
+        if not isinstance(comando_actual, dict):
+            comando_actual = {}
+        accion_actual = self.normalizar_accion_comando(comando_actual.get("accion"))
+        accion_nueva = self.normalizar_accion_comando(accion)
+        if not permitir_publicacion:
+            ejecutado = self.comando_desde_firma_ejecutada(
+                comando_actual.get("firma_ejecutada")
+            )
+            if accion_actual == "mantener" and ejecutado:
+                # Repara nodos antiguos donde "mantener" quedó como una orden
+                # pendiente. Se restaura exactamente la firma ya ejecutada; al
+                # coincidir, el ESP32 no vuelve a transmitir el código IR.
+                try:
+                    referencia.update({
+                        **ejecutado,
+                        "resultado": "ejecutado",
+                    })
+                except Exception as error:
+                    log.error({
+                        "evento": "reconciliacion_comando_firebase_sin_permiso",
+                        "area": area,
+                        "aire": aire,
+                        "error": str(error),
+                    })
+                    return {
+                        "publicado": False,
+                        "motivo": "reconciliacion_requiere_permiso_firebase",
+                        "accion_actual": comando_actual.get("accion"),
+                        "actualizado_en": comando_actual.get("actualizado_en"),
+                        "resultado": comando_actual.get("resultado"),
+                        "reparacion_requerida": ejecutado,
+                    }
+                return {
+                    "publicado": False,
+                    "motivo": "estado_reconciliado_con_firma_ejecutada",
+                    "accion_actual": ejecutado["accion"],
+                    "actualizado_en": ejecutado["actualizado_en"],
+                    "resultado": "ejecutado",
+                }
+            return {
+                "publicado": False,
+                "motivo": "control_sin_envio_ir",
+                "accion_actual": comando_actual.get("accion"),
+                "actualizado_en": comando_actual.get("actualizado_en"),
+                "resultado": comando_actual.get("resultado"),
+            }
+        if accion_actual == accion_nueva:
+            return {
+                "publicado": False,
+                "motivo": "accion_sin_cambios",
+                "accion_actual": comando_actual.get("accion"),
+                "actualizado_en": comando_actual.get("actualizado_en"),
+                "resultado": comando_actual.get("resultado"),
+            }
+
+        actualizado_en = datetime.now(timezone.utc).isoformat()
+        try:
+            referencia.update({
+                "accion": accion,
+                **(metadata or {}),
+                "actualizado_en": actualizado_en,
+                "resultado": "pendiente",
+            })
+        except Exception as error:
+            log.error({
+                "evento": "publicacion_comando_firebase_sin_permiso",
+                "area": area,
+                "aire": aire,
+                "accion": accion,
+                "error": str(error),
+            })
+            return {
+                "publicado": False,
+                "motivo": "publicacion_requiere_permiso_firebase",
+                "accion_actual": comando_actual.get("accion"),
+                "actualizado_en": comando_actual.get("actualizado_en"),
+                "resultado": comando_actual.get("resultado"),
+            }
+        return {
+            "publicado": True,
+            "motivo": "accion_cambiada",
+            "accion_anterior": comando_actual.get("accion"),
+            "accion_actual": accion,
+            "actualizado_en": actualizado_en,
+        }
+
 
     # -----------------------------------------------------------------------
     # Modelo ATMOS en tiempo real
@@ -103,9 +229,9 @@ class ServicioPredictor:
         if not seleccion["valida"]:
             horario = self.obtener_estado_horario_operacion()
             accion = "mantener"
-            firebase_db.child("Atmos").child("comandos").child(area).child(aire).update({
-                "accion": accion,
-            })
+            publicacion_comando = self.publicar_comando_si_cambio(
+                firebase_db, area, aire, accion, permitir_publicacion=False
+            )
             actualizacion_supabase = self.guardar_decision_en_registro(
                 pabellon=area,
                 aire=aire,
@@ -126,6 +252,7 @@ class ServicioPredictor:
                     "no hay lectura valida suficiente para ejecutar el modelo"
                 ),
                 "accion": accion,
+                "publicacion_comando": publicacion_comando,
                 "horario": horario,
                 "ruta_accion": f"/Atmos/comandos/{area}/{aire}/accion",
                 "actualizacion_supabase": actualizacion_supabase,
@@ -147,13 +274,41 @@ class ServicioPredictor:
             if resultado.get("valido") and resultado.get("procesado", True)
             else "mantener"
         )
+        modelo_ml = (
+            resultado.get("modelo_ml")
+            if resultado
+            else self.trazabilidad_modelo_no_usado(
+                "fuera de horario permitido; se fuerza accion apagar"
+            )
+        )
+        probabilidades = (modelo_ml or {}).get("probabilidades") or {}
+        confianza_ml = max(probabilidades.values()) if probabilidades else None
+        ruta_comando = f"/Atmos/comandos/{area}/{aire}"
+        control = (resultado or {}).get("control") or {}
+        permitir_publicacion = bool(
+            control.get("ejecutar_ir") and accion != "mantener"
+        )
 
-        firebase_db.child("Atmos").child("comandos").child(area).child(aire).update({
-            "accion": accion,
-        })
+        publicacion_comando = self.publicar_comando_si_cambio(
+            firebase_db,
+            area,
+            aire,
+            accion,
+            {
+                "origen": "modelo_ml",
+                "modelo_usado": bool((modelo_ml or {}).get("modelo_usado")),
+                "tipo_modelo": (modelo_ml or {}).get("tipo_modelo"),
+                "version_modelo": (modelo_ml or {}).get("version_modelo"),
+                "prediccion_modelo": (modelo_ml or {}).get("prediccion_modelo"),
+                "recomendacion_ml": accion,
+                "confianza_ml": confianza_ml,
+            },
+            permitir_publicacion=permitir_publicacion,
+        )
         if resultado and resultado.get("control"):
             resultado["control"]["accion_enviada"] = bool(
                 resultado["control"].get("ejecutar_ir") and accion != "mantener"
+                and publicacion_comando["publicado"]
             )
         actualizacion_supabase = self.guardar_decision_en_registro(
             pabellon=area,
@@ -161,13 +316,6 @@ class ServicioPredictor:
             accion=accion,
             resultado=resultado,
             horario=horario,
-        )
-        modelo_ml = (
-            resultado.get("modelo_ml")
-            if resultado
-            else self.trazabilidad_modelo_no_usado(
-                "fuera de horario permitido; se fuerza accion apagar"
-            )
         )
         prediccion_guardada = self.guardar_prediccion_modelo_valida(
             pabellon=area,
@@ -193,7 +341,9 @@ class ServicioPredictor:
             "resultado_modelo": self.publicar_resultado_modelo(resultado),
             "modelo_ml": modelo_ml,
             "accion": accion,
+            "publicacion_comando": publicacion_comando,
             "horario": horario,
+            "ruta_comando": ruta_comando,
             "ruta_accion": f"/Atmos/comandos/{area}/{aire}/accion",
             "actualizacion_supabase": actualizacion_supabase,
             "prediccion_guardada": prediccion_guardada,
@@ -742,38 +892,6 @@ class ServicioPredictor:
 
         registro_actual = respuesta.data[0]
         registro_id = registro_actual["id"]
-        accion_normalizada = str(accion or "").strip().lower().replace(" ", "_").replace("-", "_")
-
-        if accion_normalizada == "apagar":
-            aire_encendido = False
-        elif accion_normalizada in {"encender_22", "ahorro_24", "enfriar_fuerte"}:
-            aire_encendido = True
-        elif registro_actual.get("aire_encendido_atmos") is not None:
-            aire_encendido = bool(registro_actual["aire_encendido_atmos"])
-        else:
-            aire_encendido = float(registro_actual.get("potencia_w") or 0) > 0
-
-        potencia_w = CONSUMO_AC_KW * CANTIDAD_AIRES * 1000 if aire_encendido else 0.0
-        energia_anterior = float(registro_actual.get("energia_kwh") or 0)
-        fecha_sync = registro_actual.get("fecha_sync")
-        horas_transcurridas = 0.0
-        if fecha_sync:
-            try:
-                fecha_registro = datetime.fromisoformat(str(fecha_sync).replace("Z", "+00:00"))
-                if fecha_registro.tzinfo is None:
-                    fecha_registro = fecha_registro.replace(tzinfo=timezone.utc)
-                horas_transcurridas = max(
-                    0.0,
-                    (datetime.now(timezone.utc) - fecha_registro.astimezone(timezone.utc)).total_seconds() / 3600,
-                )
-            except ValueError:
-                horas_transcurridas = 0.0
-
-        datos.update({
-            "aire_encendido_atmos": aire_encendido,
-            "potencia_w": round(potencia_w, 2),
-            "energia_kwh": round(energia_anterior + (potencia_w / 1000) * horas_transcurridas, 6),
-        })
         cliente.table("registros").update(datos).eq("id", registro_id).execute()
         return {
             "actualizado": True,
@@ -853,13 +971,29 @@ class ServicioPredictor:
         cliente = obtener_cliente()
         respuesta = (
             cliente.table("rooms")
-            .select("id,nombre,pabellon,edificio")
+            .select("id,nombre,pabellon,edificio,aires")
             .or_(f"pabellon.eq.{pabellon},edificio.eq.{pabellon}")
             .execute()
         )
         salas = respuesta.data or []
+        aire_normalizado = aire.strip().lower()
+
+        # La interfaz muestra salas compuestas (por ejemplo, "Robótica") y
+        # oculta las salas técnicas (por ejemplo, "Aire_1"). Asociamos la
+        # predicción a la sala compuesta que declara ese aire para que pueda
+        # consultarse desde la pantalla de Predicciones ATMOS.
         for sala in salas:
-            if str(sala.get("nombre") or "").strip().lower() == aire.strip().lower():
+            nombre_normalizado = str(sala.get("nombre") or "").strip().lower()
+            aires = {
+                str(item).strip().lower()
+                for item in (sala.get("aires") or [])
+                if str(item).strip()
+            }
+            if aire_normalizado in aires and nombre_normalizado != aire_normalizado:
+                return sala.get("id")
+
+        for sala in salas:
+            if str(sala.get("nombre") or "").strip().lower() == aire_normalizado:
                 return sala.get("id")
         if len(salas) == 1:
             return salas[0].get("id")
@@ -888,8 +1022,8 @@ class ServicioPredictor:
                 "motivo": (modelo_ml or {}).get("motivo_no_usado") or "modelo no usado",
             }
 
-        sala_id = actualizacion_supabase.get("sala_id") or self.resolver_sala_id_por_pabellon_aire(
-            pabellon, aire
+        sala_id = self.resolver_sala_id_por_pabellon_aire(pabellon, aire) or (
+            actualizacion_supabase.get("sala_id")
         )
         if not sala_id:
             return {"guardada": False, "motivo": "no se pudo resolver sala_id"}
@@ -1036,7 +1170,7 @@ class ServicioPredictor:
         cliente = obtener_cliente()
         respuesta = (
             cliente.table("rooms")
-            .select("id,nombre,pabellon,edificio")
+            .select("id,nombre,pabellon,edificio,aires")
             .eq("id", str(sala_id))
             .limit(1)
             .execute()
@@ -1063,19 +1197,20 @@ class ServicioPredictor:
             return []
 
         pabellon = sala.get("pabellon") or sala.get("edificio")
+        aires = sala.get("aires") or []
         aire = sala.get("nombre")
-        if not pabellon or not aire:
+        if not pabellon or (not aire and not aires):
             return []
 
-        respuesta = (
+        consulta = (
             cliente.table("registros")
             .select("*")
             .eq("pabellon", pabellon)
-            .eq("aire", aire)
             .gte("fecha_sync", desde)
             .order("fecha_sync", desc=False)
-            .execute()
         )
+        consulta = consulta.in_("aire", aires) if aires else consulta.eq("aire", aire)
+        respuesta = consulta.execute()
         return respuesta.data or []
 
     def obtener_ultimo_registro_sala(self, sala_id: UUID | str) -> dict | None:
@@ -1096,19 +1231,20 @@ class ServicioPredictor:
             return None
 
         pabellon = sala.get("pabellon") or sala.get("edificio")
+        aires = sala.get("aires") or []
         aire = sala.get("nombre")
-        if not pabellon or not aire:
+        if not pabellon or (not aire and not aires):
             return None
 
-        respuesta = (
+        consulta = (
             cliente.table("registros")
             .select("*")
             .eq("pabellon", pabellon)
-            .eq("aire", aire)
             .order("fecha_sync", desc=True)
             .limit(1)
-            .execute()
         )
+        consulta = consulta.in_("aire", aires) if aires else consulta.eq("aire", aire)
+        respuesta = consulta.execute()
         if respuesta.data:
             return {**respuesta.data[0], "sala_id": str(sala_id)}
         return None

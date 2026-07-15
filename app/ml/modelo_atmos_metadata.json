@@ -1,0 +1,32 @@
+{
+  "version": "modelo_atmos_rf_v1",
+  "tipo_modelo": "RandomForestClassifier",
+  "tipo_evaluacion": "holdout_sintetico_reproducible",
+  "semilla_separacion": 42,
+  "proporcion_validacion": 0.2,
+  "n_muestras": 1700,
+  "n_muestras_entrenamiento": 1360,
+  "n_muestras_validacion": 340,
+  "features": [
+    "presencia",
+    "temp_ambiente",
+    "temp_ac",
+    "delta_t",
+    "humedad"
+  ],
+  "clases": [
+    "apagar",
+    "enfriar_fuerte",
+    "mantener"
+  ],
+  "accuracy": 1.0,
+  "precision": 1.0,
+  "recall": 1.0,
+  "f1": 1.0,
+  "matriz_confusion": [
+    [148, 0, 0],
+    [0, 97, 0],
+    [0, 0, 95]
+  ],
+  "nota": "Metricas del modelo activo verificadas contra el holdout determinista del pipeline de entrenamiento. El modelo activo coincide con la replica reproducida en predicciones e importancia de variables."
+}

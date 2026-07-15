@@ -9,10 +9,31 @@ import httpx
 from app.config import configuracion
 from app.core.aires import es_aire_ignorado
 from app.core.database import obtener_cliente, obtener_firebase
-from app.ml.impacto import estimar_consumo_registro, inferir_accion, inferir_ac_encendido
+from app.ml.impacto import (
+    ACCIONES_APAGADO,
+    ACCIONES_ENCENDIDO,
+    estimar_consumo_registro,
+    inferir_accion,
+    inferir_ac_encendido,
+    obtener_medicion_electrica_firebase,
+)
 
 
 ZONA_HORARIA_PANAMA = timezone(timedelta(hours=-5), "America/Panama")
+
+CAMPOS_ELECTRICOS_FIREBASE = {
+    "corriente_rms",
+    "voltaje_red_v",
+    "factor_potencia",
+    "potencia_aparente_va",
+    "potencia_activa_w",
+    "potencia_activa_kw",
+    "consumo_intervalo_kwh",
+    "consumo_acumulado_sesion_kwh",
+    "tarifa_kwh",
+    "costo_intervalo",
+    "costo_acumulado_sesion",
+}
 
 
 def _a_booleano(valor: Any) -> bool:
@@ -332,6 +353,7 @@ def preparar_registro_supabase(
         registro_anterior=registro_anterior,
         fecha_actual=fecha_sync,
     )
+    medicion_electrica = obtener_medicion_electrica_firebase(valor)
 
     potencia_w = _a_numero(
         valor.get("potencia_w", valor.get("power_w")),
@@ -343,7 +365,7 @@ def preparar_registro_supabase(
     )
     accion = inferir_accion(valor)
 
-    return {
+    registro = {
         "firebase_key": f"{pabellon}_{aire}_{firebase_key}",
         "sala_id": sala_id,
         "nodo_id": nodo_id,
@@ -370,14 +392,16 @@ def preparar_registro_supabase(
             valor.get("recomendacion", ""),
         ),
         "control_ir_activo": _a_booleano(valor.get("control_ir_activo", False)),
-        "aire_encendido_atmos": (
-            _a_booleano(valor.get("aire_encendido_atmos"))
-            if valor.get("aire_encendido_atmos") is not None
-            else inferir_ac_encendido(valor, registro_anterior)
-        ),
+        "aire_encendido_atmos": inferir_ac_encendido(valor, registro_anterior),
         "ultima_accion_ejecutada": valor.get("ultima_accion_ejecutada", accion),
         "fecha_sync": fecha_sync.isoformat(),
     }
+    registro.update({
+        campo: numero
+        for campo, numero in medicion_electrica.items()
+        if numero is not None
+    })
+    return registro
 
 
 def leer_ultimas_lecturas_firebase_rest(
@@ -420,6 +444,36 @@ def leer_ultima_lectura_valida_firebase_rest(
     }
 
 
+def leer_comando_firebase_rest(pabellon: str, aire: str) -> dict:
+    database_url = configuracion.FIREBASE_DATABASE_URL.rstrip("/")
+    ruta = (
+        f"Atmos/comandos/{quote(str(pabellon).strip(), safe='')}/"
+        f"{quote(str(aire).strip(), safe='')}.json"
+    )
+    respuesta = httpx.get(f"{database_url}/{ruta}", timeout=8)
+    respuesta.raise_for_status()
+    datos = respuesta.json()
+    return datos if isinstance(datos, dict) else {}
+
+
+def aplicar_estado_comando_firebase(valor: dict, pabellon: str, aire: str) -> dict:
+    """Usa /Atmos/comandos como fuente de verdad del estado ejecutado del AC."""
+    try:
+        comando = leer_comando_firebase_rest(pabellon, aire)
+    except Exception:
+        return valor
+
+    accion = inferir_accion(comando)
+    if accion not in ACCIONES_ENCENDIDO and accion not in ACCIONES_APAGADO:
+        return valor
+
+    return {
+        **valor,
+        "aire_encendido_atmos": accion in ACCIONES_ENCENDIDO,
+        "ultima_accion_ejecutada": accion,
+    }
+
+
 def guardar_registro_supabase_rest(registro: dict) -> dict:
     supabase_url = configuracion.SUPABASE_URL.strip().strip('"').strip("'").rstrip("/")
     supabase_key = (
@@ -438,6 +492,17 @@ def guardar_registro_supabase_rest(registro: dict) -> dict:
         "Prefer": "resolution=merge-duplicates,return=representation",
     }
     respuesta = httpx.post(url, headers=headers, json=registro, timeout=8)
+    if respuesta.status_code == 400 and any(
+        campo in respuesta.text for campo in CAMPOS_ELECTRICOS_FIREBASE
+    ):
+        # Compatibilidad mientras se aplica la migración de columnas. Los
+        # campos potencia_w y energia_kwh ya contienen la medición normalizada.
+        registro_compatible = {
+            campo: valor
+            for campo, valor in registro.items()
+            if campo not in CAMPOS_ELECTRICOS_FIREBASE
+        }
+        respuesta = httpx.post(url, headers=headers, json=registro_compatible, timeout=8)
     respuesta.raise_for_status()
     datos = respuesta.json()
     return datos[0] if isinstance(datos, list) and datos else registro
@@ -601,6 +666,7 @@ def sincronizar_firebase_supabase(
                     })
                     continue
 
+                valor = aplicar_estado_comando_firebase(valor, pabellon, aire)
                 registro_anterior = obtener_ultimo_registro_supabase_rest(pabellon, aire)
                 registro = preparar_registro_supabase(
                     pabellon=pabellon,

@@ -24,6 +24,9 @@ class Configuracion(BaseSettings):
     # Baseline validado pre-ATMOS usado para calcular ahorro estimado.
     DASHBOARD_BASELINE_KWH_DIA: float = 36.0
     DASHBOARD_TARIFA_USD_KWH: float = 0.17
+    # Histéresis para inferir el estado físico del AC desde potencia activa.
+    AC_POWER_ON_THRESHOLD_W: float = 50.0
+    AC_POWER_OFF_THRESHOLD_W: float = 20.0
 
     # VAPID — notificaciones push
     vapid_clave_privada: str = ""

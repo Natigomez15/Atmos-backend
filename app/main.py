@@ -15,6 +15,7 @@ from app.core.logger import log
 from app.core.websocket_manager import gestor
 from app.services.alert_service import ServicioAlertas
 from app.services.sincronizador_firebase import sincronizar_firebase_supabase
+from app.ml.predictor import ServicioPredictor
 
 app = FastAPI(title="ATMOS API")
 aplicacion = app
@@ -81,17 +82,45 @@ async def iniciar_sincronizacion_firebase():
                             objetivos.add((str(pabellon), str(aire)))
 
                 resultados = []
+                decisiones_ml = []
                 for pabellon, aire in sorted(objetivos):
-                    resultados.append(await asyncio.to_thread(
+                    sincronizacion = await asyncio.to_thread(
                         sincronizar_firebase_supabase,
                         pabellon,
                         aire,
-                    ))
+                    )
+                    resultados.append(sincronizacion)
+
+                    # Ejecutar el modelo una sola vez por lectura nueva. El
+                    # predictor aplica horario/reglas de seguridad, publica la
+                    # accion en Firebase y persiste la prediccion en Supabase.
+                    if sincronizacion.get("sincronizados", 0) > 0:
+                        try:
+                            decision = await asyncio.to_thread(
+                                ServicioPredictor().decidir_atmos_desde_firebase,
+                                pabellon,
+                                aire,
+                            )
+                            decisiones_ml.append({
+                                "pabellon": pabellon,
+                                "aire": aire,
+                                "accion": decision.get("accion"),
+                                "modelo_usado": (decision.get("modelo_ml") or {}).get("modelo_usado"),
+                                "prediccion_guardada": decision.get("prediccion_guardada"),
+                            })
+                        except Exception as error_ml:
+                            log.error({
+                                "evento": "decision_ml_automatica_error",
+                                "pabellon": pabellon,
+                                "aire": aire,
+                                "error": str(error_ml),
+                            })
                 resultado = {
                     "objetivos": len(objetivos),
                     "sincronizados": sum(r.get("sincronizados", 0) for r in resultados),
                     "errores": sum(r.get("errores", 0) for r in resultados),
                     "resultados": resultados,
+                    "decisiones_ml": decisiones_ml,
                 }
                 log.info({
                     "evento": "sincronizacion_firebase_periodica",

@@ -712,10 +712,7 @@ async def dashboard_energia(range: Annotated[str, Query(alias="range")] = "24h")
     respuesta = (
         obtener_cliente()
         .table("registros")
-        .select(
-            "fecha_sync,potencia_w,energia_kwh,estado_ocupacion,"
-            "aire_encendido_atmos,pabellon,aire"
-        )
+        .select("*")
         .gte("fecha_sync", desde_iso)
         # El volumen puede superar 10,000 filas en 30 dias. Se solicitan las
         # mas recientes para que el limite no deje fuera las lecturas de hoy;

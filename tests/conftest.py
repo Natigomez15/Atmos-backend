@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch, AsyncMock
 from httpx import AsyncClient, ASGITransport
 
 from app.main import aplicacion
+from app.core.security import requerir_admin, requerir_mantenimiento_o_admin
 
 
 # ---------------------------------------------------------------------------
@@ -49,11 +50,21 @@ def mock_supabase(monkeypatch) -> MagicMock:
 @pytest.fixture
 async def cliente_prueba(mock_supabase) -> AsyncClient:
     """Cliente HTTP asíncrono que habla directamente con la app ASGI."""
-    async with AsyncClient(
-        transport=ASGITransport(app=aplicacion),
-        base_url="http://test",
-    ) as cliente:
-        yield cliente
+    aplicacion.dependency_overrides[requerir_admin] = lambda: {
+        "id": "usuario-admin-prueba", "rol": "admin", "esta_activo": True,
+    }
+    aplicacion.dependency_overrides[requerir_mantenimiento_o_admin] = lambda: {
+        "id": "usuario-admin-prueba", "rol": "admin", "esta_activo": True,
+    }
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=aplicacion),
+            base_url="http://test",
+        ) as cliente:
+            yield cliente
+    finally:
+        aplicacion.dependency_overrides.pop(requerir_admin, None)
+        aplicacion.dependency_overrides.pop(requerir_mantenimiento_o_admin, None)
 
 
 @pytest.fixture

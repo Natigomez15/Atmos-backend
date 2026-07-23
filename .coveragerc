@@ -1,0 +1,5 @@
+[run]
+omit =
+    app/ml/modelo_ia_atmos_organizado.py
+    app/core/firebase_config.py
+    app/services/sensor_service.py

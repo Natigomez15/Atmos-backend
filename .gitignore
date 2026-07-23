@@ -3,8 +3,15 @@ serviceAccountKey.json
 .venv/
 .venv-local/
 .venv311/
+.venv-*/
 __pycache__/
+**/__pycache__/
 .coverage
+htmlcov/
+.pytest_cache/
+*.py[cod]
+*.tmp
+*.temp
 logs/
 *.log
 private_key.pem

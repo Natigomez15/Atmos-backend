@@ -1,7 +1,7 @@
 """
 Pruebas para el router /api/v1/lecturas
 """
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 SALA_ID = "00000000-0000-0000-0000-000000000002"
 NODO_ID = "00000000-0000-0000-0000-000000000001"
@@ -32,7 +32,7 @@ async def test_crear_lectura_exitoso(
     ]
 
     with patch("app.api.readings.gestor") as mock_gestor:
-        mock_gestor.transmitir_a_sala = MagicMock(return_value=None)
+        mock_gestor.transmitir_a_sala = AsyncMock(return_value=None)
         respuesta = await cliente_prueba.post("/api/v1/lecturas/", json=CUERPO_LECTURA)
 
     assert respuesta.status_code == 201

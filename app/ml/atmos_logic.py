@@ -1,4 +1,5 @@
 from datetime import datetime, time
+from math import isfinite
 from zoneinfo import ZoneInfo
 
 try:
@@ -115,19 +116,36 @@ def decidir(row):
 def validar_lectura(presencia, temp_ambiente, temp_ac, humedad, minutos_sin_presencia=0):
     errores = []
 
-    if presencia not in [0, 1]:
+    def es_numero_valido(valor):
+        return (
+            isinstance(valor, (int, float))
+            and not isinstance(valor, bool)
+            and isfinite(valor)
+        )
+
+    if not es_numero_valido(presencia):
+        errores.append("La variable 'presencia' debe ser un número 0 o 1.")
+    elif presencia not in [0, 1]:
         errores.append("La variable 'presencia' debe ser 0 o 1.")
 
-    if temp_ambiente < 10 or temp_ambiente > 45:
+    if not es_numero_valido(temp_ambiente):
+        errores.append("La temperatura ambiente debe ser un número válido.")
+    elif temp_ambiente < 10 or temp_ambiente > 45:
         errores.append("La temperatura ambiente está fuera de un rango lógico (10°C a 45°C).")
 
-    if temp_ac < 5 or temp_ac > 35:
+    if not es_numero_valido(temp_ac):
+        errores.append("La temperatura del AC debe ser un número válido.")
+    elif temp_ac < 5 or temp_ac > 35:
         errores.append("La temperatura del AC está fuera de un rango lógico (5°C a 35°C).")
 
-    if humedad < 0 or humedad > 100:
+    if not es_numero_valido(humedad):
+        errores.append("La humedad debe ser un número válido.")
+    elif humedad < 0 or humedad > 100:
         errores.append("La humedad debe estar entre 0% y 100%.")
 
-    if minutos_sin_presencia < 0:
+    if not es_numero_valido(minutos_sin_presencia):
+        errores.append("Los minutos sin presencia deben ser un número válido.")
+    elif minutos_sin_presencia < 0:
         errores.append("Los minutos sin presencia no pueden ser negativos.")
 
     return {

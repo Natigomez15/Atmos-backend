@@ -54,7 +54,6 @@ def obtener_usuario_opcional(
 
 
 def requerir_admin(
-    usuario: dict = None,
     authorization: str | None = Header(default=None),
 ) -> dict:
     usuario = obtener_usuario_actual(authorization)

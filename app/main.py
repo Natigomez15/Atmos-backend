@@ -174,11 +174,14 @@ async def estado_servicio():
         obtener_cliente().table("rooms").select("count", count="exact").limit(1).execute()
         return {"estado": "ok", "servicio": "atmos-api", "base_de_datos": "conectada"}
     except Exception:
-        return {
-            "estado": "degradado",
-            "servicio": "atmos-api",
-            "base_de_datos": "inalcanzable",
-        }
+        return JSONResponse(
+            status_code=503,
+            content={
+                "estado": "degradado",
+                "servicio": "atmos-api",
+                "base_de_datos": "inalcanzable",
+            },
+        )
 
 
 @app.get("/")

@@ -16,16 +16,133 @@ from app.core.websocket_manager import gestor
 from app.services.aggregation import agregar_lecturas, ServicioAgregacion
 from app.services.alert_service import ServicioAlertas
 from app.services.sincronizador_firebase import (
+    MAX_LECTURAS_FIREBASE_POR_CONSULTA,
     aplicar_estado_comando_firebase,
     sincronizar_firebase_supabase,
     leer_ultimas_lecturas_firebase_rest,
     leer_ultima_lectura_valida_firebase_rest,
     preparar_registro_supabase,
 )
+from app.ml.impacto import obtener_medicion_electrica_firebase
 from app.config import configuracion
 from app.core.limiter import limitador
 
 enrutador = APIRouter(prefix="/lecturas", tags=["lecturas"])
+
+FIREBASE_PUSH_CHARS = "-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
+
+
+def _fecha_desde_firebase_push_id(firebase_key: str) -> datetime | None:
+    """Extrae la fecha UTC codificada en los primeros 8 caracteres del push ID."""
+    if len(firebase_key) < 8:
+        return None
+    milisegundos = 0
+    try:
+        for caracter in firebase_key[:8]:
+            milisegundos = milisegundos * 64 + FIREBASE_PUSH_CHARS.index(caracter)
+        return datetime.fromtimestamp(milisegundos / 1000, tz=timezone.utc)
+    except (ValueError, OSError, OverflowError):
+        return None
+
+
+def _normalizar_historial_firebase(
+    lecturas_firebase: dict,
+    pabellon: str,
+    aire: str,
+) -> list[dict]:
+    registros = []
+    for firebase_key, valor in sorted(lecturas_firebase.items(), reverse=True):
+        if not isinstance(valor, dict):
+            continue
+        registro = preparar_registro_supabase(
+            pabellon=pabellon,
+            aire=aire,
+            firebase_key=firebase_key,
+            valor=valor,
+        )
+        fecha_lectura = _fecha_desde_firebase_push_id(firebase_key)
+        if fecha_lectura is not None:
+            registro["fecha_sync"] = fecha_lectura.isoformat()
+        registros.append(registro)
+    return registros
+
+
+def _completar_potencia_historica_desde_firebase(
+    registros: list[dict],
+    lecturas_firebase: dict,
+    pabellon: str,
+    aire: str,
+) -> list[dict]:
+    """Cruza por firebase_key sin escribir ni alterar el orden histórico."""
+    prefijo = f"{pabellon}_{aire}_"
+    completados = []
+    for registro_original in registros:
+        registro = dict(registro_original)
+        firebase_key = str(registro.get("firebase_key") or "")
+        key_lectura = (
+            firebase_key[len(prefijo):]
+            if firebase_key.startswith(prefijo)
+            else firebase_key
+        )
+        lectura = lecturas_firebase.get(key_lectura)
+        if isinstance(lectura, dict):
+            medicion = obtener_medicion_electrica_firebase(lectura)
+            potencia_activa_w = medicion.get("potencia_activa_w")
+            if potencia_activa_w is not None:
+                registro["potencia_w"] = potencia_activa_w
+            registro.update({
+                campo: valor
+                for campo, valor in medicion.items()
+                if valor is not None
+            })
+        completados.append(registro)
+    return completados
+
+
+def _agrupar_potencia_activa_firebase(
+    lecturas_firebase: dict,
+    dias: int,
+    ahora: datetime | None = None,
+) -> list[dict]:
+    """Agrupa por hora únicamente la potencia activa reportada por Firebase."""
+    limite_fecha = (ahora or datetime.now(timezone.utc)) - timedelta(days=dias)
+    cubos: dict[datetime, list[float]] = {}
+
+    for firebase_key, valor in lecturas_firebase.items():
+        if not isinstance(valor, dict):
+            continue
+        fecha = _fecha_desde_firebase_push_id(firebase_key)
+        if fecha is None or fecha < limite_fecha:
+            continue
+
+        potencia = valor.get("potencia_activa_w")
+        if potencia in (None, ""):
+            potencia_kw = valor.get("potencia_activa_kw")
+            try:
+                potencia = float(potencia_kw) * 1000 if potencia_kw not in (None, "") else None
+            except (TypeError, ValueError):
+                potencia = None
+        try:
+            potencia_w = float(potencia) if potencia not in (None, "") else None
+        except (TypeError, ValueError):
+            potencia_w = None
+        if potencia_w is None:
+            continue
+
+        cubo = fecha.astimezone(timezone.utc).replace(
+            minute=0, second=0, microsecond=0
+        )
+        cubos.setdefault(cubo, []).append(potencia_w)
+
+    return [
+        {
+            "bucket_hour": cubo.isoformat(),
+            "avg_power_w": round(sum(valores) / len(valores), 2),
+            "reading_count": len(valores),
+            "source": "firebase_potencia_activa_w",
+        }
+        for cubo, valores in sorted(cubos.items())
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -221,12 +338,67 @@ async def obtener_aires_de_pabellon(pabellon: str):
     return aires
 
 
+@enrutador.get("/registros/potencia-activa")
+async def obtener_potencia_activa_firebase(
+    pabellon: str,
+    aire: str,
+    dias: Annotated[int, Query(ge=1, le=7)] = 7,
+):
+    """Histórico horario de potencia activa; Firebase es la única fuente."""
+    try:
+        lecturas = leer_ultimas_lecturas_firebase_rest(
+            pabellon=pabellon,
+            aire=aire,
+            # El gráfico se refresca desde el navegador: limitar la ventana
+            # protege Firebase incluso si cambian los parámetros del cliente.
+            limite=MAX_LECTURAS_FIREBASE_POR_CONSULTA,
+        )
+        return _agrupar_potencia_activa_firebase(lecturas, dias)
+    except Exception as error:
+        log.error({
+            "evento": "potencia_activa_firebase_no_disponible",
+            "pabellon": pabellon,
+            "aire": aire,
+            "error": str(error),
+        })
+        raise HTTPException(
+            status_code=502,
+            detail="No se pudo leer la potencia activa desde Firebase.",
+        ) from error
+
+
 @enrutador.get("/registros", response_model=list[RegistroRespuesta])
 async def listar_registros(
     pabellon: str | None = None,
     aire: str | None = None,
-    limite: Annotated[int, Query(ge=1, le=1000)] = 100,
+    limite: Annotated[int, Query(ge=1, le=MAX_LECTURAS_FIREBASE_POR_CONSULTA)] = 100,
 ):
+    # Para una zona/aire concretos, Firebase es la fuente primaria y única de
+    # esta lectura. La copia en Supabase se mantiene mediante el sincronizador.
+    if pabellon and aire:
+        try:
+            lecturas_firebase = leer_ultimas_lecturas_firebase_rest(
+                pabellon=pabellon,
+                aire=aire,
+                limite=limite,
+            )
+            return _normalizar_historial_firebase(
+                lecturas_firebase,
+                pabellon,
+                aire,
+            )
+        except Exception as error:
+            log.error({
+                "evento": "historial_firebase_no_disponible",
+                "pabellon": pabellon,
+                "aire": aire,
+                "error": str(error),
+            })
+            raise HTTPException(
+                status_code=502,
+                detail="No se pudo leer el historial directamente desde Firebase.",
+            ) from error
+
     cliente = obtener_cliente()
     consulta = (
         cliente.table("registros")
@@ -239,7 +411,7 @@ async def listar_registros(
     if aire:
         consulta = consulta.eq("aire", aire)
     respuesta = consulta.execute()
-    return respuesta.data
+    return respuesta.data or []
 
 
 @enrutador.get("/registros/agregado")

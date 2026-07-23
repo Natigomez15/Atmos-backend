@@ -20,6 +20,7 @@ from app.ml.impacto import (
 
 
 ZONA_HORARIA_PANAMA = timezone(timedelta(hours=-5), "America/Panama")
+MAX_LECTURAS_FIREBASE_POR_CONSULTA = 100
 
 CAMPOS_ELECTRICOS_FIREBASE = {
     "corriente_rms",
@@ -409,6 +410,9 @@ def leer_ultimas_lecturas_firebase_rest(
     aire: str,
     limite: int = 1,
 ) -> dict:
+    # Esta función es la única puerta de lectura REST del historial Firebase.
+    # Nunca debe convertir una consulta de pantalla en una descarga completa.
+    limite = min(max(1, int(limite)), MAX_LECTURAS_FIREBASE_POR_CONSULTA)
     database_url = configuracion.FIREBASE_DATABASE_URL.rstrip("/")
     ruta = (
         f"Atmos/registro/{quote(str(pabellon).strip(), safe='')}/"
@@ -617,9 +621,13 @@ def sincronizar_firebase_supabase(
         }
         metadata_seleccion = seleccion
     else:
-        firebase_db = obtener_firebase()
-        datos = firebase_db.child("Atmos").child("registro").get().val()
-        metadata_seleccion = None
+        # El modo heredado leía /Atmos/registro completo, incluyendo el
+        # historial de todos los aires. No hay un consumidor actual que deba
+        # hacerlo: las llamadas soportadas siempre identifican pabellón y aire.
+        raise ValueError(
+            "La sincronización Firebase requiere pabellon_objetivo y aire_objetivo; "
+            "no se permite leer /Atmos/registro completo."
+        )
 
     if not datos:
         return {"sincronizados": 0, "errores": 0, "mensaje": "No hay datos en Firebase."}
@@ -714,13 +722,13 @@ def sincronizar_firebase_supabase(
     }
 
 
-def sincronizar(intervalo_segundos: int = 15):
+def sincronizar(intervalo_segundos: int = 60):
     print("Sincronizando ATMOS Firebase -> Supabase...")
 
     while True:
         resultado = sincronizar_firebase_supabase()
         print("Resultado sincronización:", resultado)
-        time.sleep(intervalo_segundos)
+        time.sleep(max(60, intervalo_segundos))
 
 
 if __name__ == "__main__":

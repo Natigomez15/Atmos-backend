@@ -138,7 +138,9 @@ async def iniciar_sincronizacion_firebase():
                     "evento": "sincronizacion_firebase_error",
                     "error": str(error),
                 })
-            await asyncio.sleep(configuracion.FIREBASE_SYNC_INTERVAL_SECONDS)
+            # No permitir que una variable de entorno vuelva a habilitar un
+            # sondeo agresivo de Firebase. Cada ciclo lee una ventana acotada.
+            await asyncio.sleep(max(60, configuracion.FIREBASE_SYNC_INTERVAL_SECONDS))
 
     asyncio.create_task(bucle_sincronizacion())
 

@@ -182,6 +182,74 @@ def _calcular_energia_kwh(filas: list[dict]) -> float:
     return 0
 
 
+def _resumir_consumo_total_aires(filas: list[dict]) -> dict:
+    """Suma consumo y costo por intervalo, sin mezclar acumulados entre aires."""
+    por_aire: dict[tuple[str, str], list[dict]] = {}
+    for fila in filas:
+        clave = (str(fila.get("pabellon") or ""), str(fila.get("aire") or ""))
+        por_aire.setdefault(clave, []).append(fila)
+
+    consumo_total = 0.0
+    costo_total = 0.0
+    equipos_contabilizados = 0
+    for lecturas in por_aire.values():
+        lecturas_ordenadas = sorted(
+            lecturas,
+            key=lambda fila: str(fila.get("fecha_sync") or ""),
+        )
+        anterior = None
+        equipo_con_consumo = False
+        for lectura in lecturas_ordenadas:
+            consumo = lectura.get("consumo_intervalo_kwh")
+            try:
+                consumo_kwh = max(0.0, float(consumo)) if consumo is not None else None
+            except (TypeError, ValueError):
+                consumo_kwh = None
+
+            if consumo_kwh is None and anterior is not None:
+                try:
+                    inicio = datetime.fromisoformat(
+                        str(anterior.get("fecha_sync")).replace("Z", "+00:00")
+                    )
+                    fin = datetime.fromisoformat(
+                        str(lectura.get("fecha_sync")).replace("Z", "+00:00")
+                    )
+                    segundos = max(0.0, min((fin - inicio).total_seconds(), 10 * 60))
+                    potencia_w = float(
+                        anterior.get("potencia_activa_w")
+                        if anterior.get("potencia_activa_w") is not None
+                        else anterior.get("potencia_w")
+                    )
+                    consumo_kwh = potencia_w / 1000 * (segundos / 3600)
+                except (TypeError, ValueError):
+                    consumo_kwh = None
+
+            if consumo_kwh is not None:
+                equipo_con_consumo = True
+                consumo_total += consumo_kwh
+                costo_intervalo = lectura.get("costo_intervalo")
+                try:
+                    costo = max(0.0, float(costo_intervalo)) if costo_intervalo is not None else None
+                except (TypeError, ValueError):
+                    costo = None
+                if costo is None:
+                    try:
+                        tarifa = float(lectura.get("tarifa_kwh"))
+                    except (TypeError, ValueError):
+                        tarifa = configuracion.DASHBOARD_TARIFA_USD_KWH
+                    costo = consumo_kwh * tarifa
+                costo_total += costo
+            anterior = lectura
+        if equipo_con_consumo:
+            equipos_contabilizados += 1
+
+    return {
+        "total_energy_kwh": round(consumo_total, 6),
+        "total_cost_usd": round(costo_total, 6),
+        "rooms_count": equipos_contabilizados,
+    }
+
+
 def _guardar_historial_reporte(cliente, *, tipo: str, carga: dict | None, resultado: dict, usuario: dict | None = None):
     periodo = (carga or {}).get("period", {})
     datos = {

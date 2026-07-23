@@ -1,5 +1,6 @@
 from datetime import datetime, time, timedelta, timezone
 from functools import lru_cache
+from math import isfinite
 from pathlib import Path
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -1284,7 +1285,14 @@ class ServicioPredictor:
                 for f in filas
                 if f.get("humedad") is not None
             ]
-            potencias = [float(f.get("potencia_w") or 0) for f in filas]
+            potencias = []
+            for fila in filas:
+                try:
+                    potencia = float(fila.get("potencia_w"))
+                except (TypeError, ValueError):
+                    continue
+                if isfinite(potencia) and potencia > 0:
+                    potencias.append(potencia)
             energias = [
                 float(f["energia_kwh"])
                 for f in filas
@@ -1345,10 +1353,58 @@ class ServicioPredictor:
                 "fuente":               "hourly_aggregates",
             })
 
-        if caracteristicas:
+        # Las filas históricas agregadas con 0 W no deben ocultar mediciones
+        # reales disponibles en registros para la misma hora.
+        desde_registros = self.obtener_caracteristicas_desde_registros(
+            sala_id, dias_atras
+        )
+        if not caracteristicas:
+            return desde_registros
+        if not desde_registros:
             return caracteristicas
 
-        return self.obtener_caracteristicas_desde_registros(sala_id, dias_atras)
+        def clave_hora(valor: object) -> str:
+            try:
+                fecha = datetime.fromisoformat(str(valor).replace("Z", "+00:00"))
+                if fecha.tzinfo is None:
+                    fecha = fecha.replace(tzinfo=timezone.utc)
+                return fecha.astimezone(timezone.utc).replace(
+                    minute=0, second=0, microsecond=0
+                ).isoformat()
+            except (TypeError, ValueError):
+                return str(valor or "")
+
+        def potencia_utilizable(valor: object) -> float | None:
+            try:
+                potencia = float(valor)
+            except (TypeError, ValueError):
+                return None
+            return potencia if isfinite(potencia) and potencia > 0 else None
+
+        registros_por_hora = {
+            clave_hora(fila["cubo_hora"]): fila
+            for fila in desde_registros
+            if fila.get("cubo_hora")
+        }
+        horas_agregadas = set()
+        for fila in caracteristicas:
+            cubo = clave_hora(fila.get("cubo_hora"))
+            horas_agregadas.add(cubo)
+            registro = registros_por_hora.get(cubo)
+            potencia_agregada = potencia_utilizable(fila.get("potencia_promedio_w"))
+            potencia_registros = potencia_utilizable(
+                registro.get("potencia_promedio_w") if registro else None
+            )
+            if potencia_agregada is None and potencia_registros is not None:
+                fila["potencia_promedio_w"] = potencia_registros
+                fila["fuente"] = "hourly_aggregates+registros"
+
+        caracteristicas.extend(
+            fila for fila in desde_registros
+            if clave_hora(fila.get("cubo_hora")) not in horas_agregadas
+        )
+        return sorted(caracteristicas, key=lambda fila: fila["cubo_hora"])
+
 
     # -----------------------------------------------------------------------
     # Guardar predicción

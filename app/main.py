@@ -91,9 +91,10 @@ async def iniciar_sincronizacion_firebase():
                     )
                     resultados.append(sincronizacion)
 
-                    # Ejecutar el modelo una sola vez por lectura nueva. El
-                    # predictor aplica horario/reglas de seguridad, publica la
-                    # accion en Firebase y persiste la prediccion en Supabase.
+                    # Ejecutar el modelo una sola vez por lectura nueva aunque
+                    # el control IR esté bloqueado. El predictor puede calcular
+                    # y persistir la recomendación; sus guardas independientes
+                    # deciden si una orden física puede publicarse.
                     if sincronizacion.get("sincronizados", 0) > 0:
                         try:
                             decision = await asyncio.to_thread(

@@ -19,9 +19,7 @@ class Configuracion(BaseSettings):
     FIREBASE_DATABASE_URL: str = ""
     FIREBASE_STORAGE_BUCKET: str = ""
     FIREBASE_SYNC_AUTOSTART: bool = False
-    # La sincronización consulta Firebase por REST. Un mínimo de un minuto evita
-    # descargar repetidamente la misma ventana de lecturas cuando el ESP32 no
-    # ha publicado datos nuevos.
+    # Firebase sync: minimo 60 s para evitar consultas repetidas.
     FIREBASE_SYNC_INTERVAL_SECONDS: int = Field(default=60, ge=60)
 
     # Control físico del AC: seguro por defecto. Solo ``active`` + ``true``

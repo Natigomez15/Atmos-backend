@@ -21,11 +21,37 @@ class RegistroCrear(BaseModel):
     delta_t: Optional[float] = None
     movimiento: Optional[int] = None
     potencia_w: Optional[float] = None
+    corriente_rms: Optional[float] = None
+    corriente_rms_cruda: Optional[float] = None
+    corriente_rms_instantanea: Optional[float] = None
+    corriente_calculada_vpp: Optional[float] = None
+    factor_calibracion_sct: Optional[float] = None
+    corriente_retenida_por_filtro: Optional[bool] = None
+    ceros_consecutivos_sct: Optional[int] = None
+    voltaje_red_v: Optional[float] = None
+    factor_potencia: Optional[float] = None
+    potencia_aparente_va: Optional[float] = None
+    potencia_activa_w: Optional[float] = None
+    potencia_activa_kw: Optional[float] = None
+    consumo_intervalo_kwh: Optional[float] = None
+    consumo_acumulado_sesion_kwh: Optional[float] = None
+    tarifa_kwh: Optional[float] = None
+    costo_intervalo: Optional[float] = None
+    costo_acumulado_sesion: Optional[float] = None
+    dht_ok: Optional[bool] = None
+    ds18b20_ok: Optional[bool] = None
+    fallos_dht: Optional[int] = None
+    fallos_ds18b20: Optional[int] = None
     energia_kwh: Optional[float] = None
     estado_ocupacion: Optional[bool] = None
     recomendacion_local: Optional[str] = None
     control_ir_activo: Optional[bool] = None
     aire_encendido_atmos: Optional[bool] = None
+    estado_deseado: Optional[str] = None
+    ultimo_comando_enviado: Optional[str] = None
+    estado_reportado_por_software: Optional[str] = None
+    estado_electrico_observado: Optional[str] = None
+    compresor_confirmado: Optional[bool] = None
     ultima_accion_ejecutada: Optional[str] = None
     fecha_sync: Optional[datetime] = None
 
@@ -147,6 +173,11 @@ class ComandoACCrear(BaseModel):
     setpoint: Optional[int] = Field(None, ge=16, le=30)
     modo: Optional[str] = None
     origen: Literal["ml_model", "manual", "schedule", "emergency"]
+    pabellon: Optional[str] = None
+    aire: Optional[str] = None
+    accion: Optional[Literal[
+        "apagar", "ahorro_24", "encender_22", "encender_23", "enfriar_fuerte"
+    ]] = None
 
 
 class ComandoACRespuesta(ComandoACCrear):
@@ -154,6 +185,10 @@ class ComandoACRespuesta(ComandoACCrear):
 
     id: int
     enviado_en: datetime
+    command_id: Optional[UUID] = None
+    created_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+    estado: Optional[str] = None
     ejecutado_en: Optional[datetime] = None
     fue_ejecutado: bool
 
@@ -162,6 +197,13 @@ class ComandoPendienteRespuesta(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    command_id: UUID
+    created_at: datetime
+    expires_at: datetime
+    estado: str
+    pabellon: str
+    aire: str
+    accion: str
     tipo_comando: str
     setpoint: Optional[int] = None
     modo: Optional[str] = None

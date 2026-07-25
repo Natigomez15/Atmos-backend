@@ -2,15 +2,26 @@ from datetime import datetime, time, timedelta, timezone
 from functools import lru_cache
 from math import isfinite
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 import joblib
 
+from app.core.control_ir import (
+    ACCIONES_IR_EXPLICITAS,
+    accion_es_no_op,
+    construir_comando_ir,
+    control_ir_habilitado,
+    estado_deseado_desde_accion,
+    evaluar_autorizacion_automatica,
+    motivo_bloqueo_control_ir,
+)
 from app.core.database import obtener_cliente
 from app.core.database import obtener_firebase
+from app.core.firebase_config import obtener_referencia_admin
 from app.core.logger import log
 from app.ml.atmos_logic import dentro_de_horario_operacion, ejecutar_atmos
+from app.ml.impacto import evaluar_estado_electrico
 from app.ml.metadata_modelo import construir_panel_modelo
 from app.services.sincronizador_firebase import leer_ultima_lectura_valida_firebase_rest
 
@@ -28,13 +39,9 @@ FEATURES_PUBLICAS_ATMOS = [
 ZONA_HORARIA_ATMOS = ZoneInfo("America/Panama")
 HORA_INICIO_OPERACION = time(6, 0)
 HORA_FIN_OPERACION = time(23, 0)
-ACCIONES_IR_RECONOCIDAS = {
-    "apagar",
-    "ahorro_24",
-    "encender_22",
-    "encender_23",
-    "enfriar_fuerte",
-}
+ACCIONES_IR_RECONOCIDAS = ACCIONES_IR_EXPLICITAS
+ALERTA_ML_TTL_MINUTOS = 10
+ESTADOS_ALERTA_ML_CERRADOS = {"aceptada", "rechazada", "obsoleta"}
 
 
 @lru_cache(maxsize=1)
@@ -67,12 +74,43 @@ class ServicioPredictor:
         metadata: dict | None = None,
         permitir_publicacion: bool = True,
     ) -> dict:
-        """Publica un comando únicamente cuando cambia la acción efectiva.
+        """Publica una orden explícita con ID y vencimiento, solo si está habilitada.
 
-        El ESP32 deduplica usando ``accion`` + ``actualizado_en``. Reescribir
-        la misma acción con una fecha nueva provoca otro envío IR, aunque el
-        equipo ya esté en ese modo.
+        ``mantener`` se corta antes de acceder a Firebase. El firmware debe
+        deduplicar por ``command_id`` persistido, además de validar el TTL.
         """
+        accion_nueva = self.normalizar_accion_comando(accion)
+        if accion_es_no_op(accion_nueva):
+            return {
+                "publicado": False,
+                "motivo": "decision_no_op",
+                "accion_actual": None,
+                "accion_solicitada": accion_nueva or "mantener",
+            }
+        if accion_nueva not in ACCIONES_IR_RECONOCIDAS:
+            return {
+                "publicado": False,
+                "motivo": "accion_ir_no_reconocida",
+                "accion_actual": None,
+                "accion_solicitada": accion_nueva,
+            }
+        if not permitir_publicacion:
+            return {
+                "publicado": False,
+                "motivo": "control_sin_envio_ir",
+                "accion_actual": None,
+                "accion_solicitada": accion_nueva,
+            }
+        bloqueo_global = motivo_bloqueo_control_ir()
+        if bloqueo_global is not None or not control_ir_habilitado():
+            return {
+                "publicado": False,
+                "motivo": bloqueo_global or "control_ir_deshabilitado",
+                "accion_actual": None,
+                "accion_solicitada": accion_nueva,
+                "dry_run": True,
+            }
+
         referencia = (
             firebase_db.child("Atmos").child("comandos").child(area).child(aire)
         )
@@ -80,49 +118,6 @@ class ServicioPredictor:
         if not isinstance(comando_actual, dict):
             comando_actual = {}
         accion_actual = self.normalizar_accion_comando(comando_actual.get("accion"))
-        accion_nueva = self.normalizar_accion_comando(accion)
-        if not permitir_publicacion:
-            ejecutado = self.comando_desde_firma_ejecutada(
-                comando_actual.get("firma_ejecutada")
-            )
-            if accion_actual == "mantener" and ejecutado:
-                # Repara nodos antiguos donde "mantener" quedó como una orden
-                # pendiente. Se restaura exactamente la firma ya ejecutada; al
-                # coincidir, el ESP32 no vuelve a transmitir el código IR.
-                try:
-                    referencia.update({
-                        **ejecutado,
-                        "resultado": "ejecutado",
-                    })
-                except Exception as error:
-                    log.error({
-                        "evento": "reconciliacion_comando_firebase_sin_permiso",
-                        "area": area,
-                        "aire": aire,
-                        "error": str(error),
-                    })
-                    return {
-                        "publicado": False,
-                        "motivo": "reconciliacion_requiere_permiso_firebase",
-                        "accion_actual": comando_actual.get("accion"),
-                        "actualizado_en": comando_actual.get("actualizado_en"),
-                        "resultado": comando_actual.get("resultado"),
-                        "reparacion_requerida": ejecutado,
-                    }
-                return {
-                    "publicado": False,
-                    "motivo": "estado_reconciliado_con_firma_ejecutada",
-                    "accion_actual": ejecutado["accion"],
-                    "actualizado_en": ejecutado["actualizado_en"],
-                    "resultado": "ejecutado",
-                }
-            return {
-                "publicado": False,
-                "motivo": "control_sin_envio_ir",
-                "accion_actual": comando_actual.get("accion"),
-                "actualizado_en": comando_actual.get("actualizado_en"),
-                "resultado": comando_actual.get("resultado"),
-            }
         if accion_actual == accion_nueva:
             return {
                 "publicado": False,
@@ -132,12 +127,16 @@ class ServicioPredictor:
                 "resultado": comando_actual.get("resultado"),
             }
 
-        actualizado_en = datetime.now(timezone.utc).isoformat()
+        sobre_comando = construir_comando_ir(
+            pabellon=area,
+            aire=aire,
+            accion=accion_nueva,
+        )
         try:
             referencia.update({
-                "accion": accion,
                 **(metadata or {}),
-                "actualizado_en": actualizado_en,
+                **sobre_comando,
+                "actualizado_en": sobre_comando["created_at"],
                 "resultado": "pendiente",
             })
         except Exception as error:
@@ -159,8 +158,477 @@ class ServicioPredictor:
             "publicado": True,
             "motivo": "accion_cambiada",
             "accion_anterior": comando_actual.get("accion"),
-            "accion_actual": accion,
-            "actualizado_en": actualizado_en,
+            "accion_actual": accion_nueva,
+            "command_id": sobre_comando["command_id"],
+            "created_at": sobre_comando["created_at"],
+            "expires_at": sobre_comando["expires_at"],
+            "actualizado_en": sobre_comando["created_at"],
+        }
+
+
+
+    def _referencia_alerta_ml(self, firebase_db, area: str, aire: str):
+        """
+        Las decisiones pendientes del ML se almacenan mediante Firebase Admin.
+
+        El parámetro ``firebase_db`` se conserva para no alterar las llamadas
+        existentes del predictor. Las órdenes físicas del aire acondicionado
+        siguen usando el mecanismo previo de publicación.
+        """
+        return obtener_referencia_admin(
+            f"/Atmos/alertas_ml/{area}/{aire}"
+        )
+
+    def _referencia_historial_alerta_ml(
+        self,
+        firebase_db,
+        area: str,
+        aire: str,
+        decision_id: str,
+    ):
+        return obtener_referencia_admin(
+            f"/Atmos/alertas_ml_historial/{area}/{aire}/{decision_id}"
+        )
+
+    @staticmethod
+    def _leer_referencia_firebase(referencia):
+        """
+        Lee una referencia de Firebase Admin y mantiene compatibilidad
+        con referencias Pyrebase si alguna llamada futura las utiliza.
+        """
+        valor = referencia.get()
+
+        if hasattr(valor, "val"):
+            valor = valor.val()
+
+        return valor
+
+    @staticmethod
+    def _fecha_iso_utc() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def _parsear_iso_utc(valor: str | None) -> datetime | None:
+        if not valor:
+            return None
+        try:
+            fecha = datetime.fromisoformat(str(valor).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        if fecha.tzinfo is None:
+            fecha = fecha.replace(tzinfo=timezone.utc)
+        return fecha.astimezone(timezone.utc)
+
+    def obtener_decision_ml_pendiente(
+        self,
+        area: str = "robotica",
+        aire: str = "Aire_1",
+    ) -> dict:
+        firebase_db = obtener_firebase()
+        referencia = self._referencia_alerta_ml(firebase_db, area, aire)
+        datos = self._leer_referencia_firebase(referencia) or {}
+
+        if not isinstance(datos, dict) or datos.get("estado") != "pendiente":
+            return {
+                "hay_pendiente": False,
+                "area": area,
+                "aire": aire,
+                "decision": None,
+            }
+
+        expira_en = self._parsear_iso_utc(datos.get("expira_en"))
+        if expira_en is not None and datetime.now(timezone.utc) > expira_en:
+            ahora = self._fecha_iso_utc()
+            actualizacion = {
+                "estado": "obsoleta",
+                "respondida_en": ahora,
+                "motivo_cierre": "decision_expirada_sin_respuesta",
+            }
+            referencia.update(actualizacion)
+            decision_id = str(datos.get("decision_id") or "")
+            if decision_id:
+                self._referencia_historial_alerta_ml(
+                    firebase_db,
+                    area,
+                    aire,
+                    decision_id,
+                ).update({**datos, **actualizacion})
+            return {
+                "hay_pendiente": False,
+                "area": area,
+                "aire": aire,
+                "decision": None,
+            }
+
+        return {
+            "hay_pendiente": True,
+            "area": area,
+            "aire": aire,
+            "decision": datos,
+        }
+
+    def cerrar_alerta_ml_pendiente(
+        self,
+        firebase_db,
+        area: str,
+        aire: str,
+        motivo: str,
+    ) -> dict:
+        """Cierra el ciclo operativo actual para permitir una decisión futura.
+
+        Si la decisión estaba pendiente, queda como obsoleta también en el
+        historial. Si ya había sido aceptada o rechazada, el historial conserva
+        ese resultado y solo registra que el ciclo fue rearmado.
+        """
+        referencia = self._referencia_alerta_ml(firebase_db, area, aire)
+        actual = self._leer_referencia_firebase(referencia) or {}
+
+        if not isinstance(actual, dict) or not actual.get("decision_id"):
+            return {
+                "cerrada": False,
+                "motivo": "sin_alerta_ml_actual",
+            }
+
+        estado_anterior = str(actual.get("estado") or "").strip().lower()
+        if estado_anterior == "obsoleta":
+            return {
+                "cerrada": False,
+                "motivo": "ciclo_ya_cerrado",
+                "decision_id": actual.get("decision_id"),
+            }
+
+        ahora = self._fecha_iso_utc()
+        actualizacion = {
+            "estado": "obsoleta",
+            "ciclo_cerrado_en": ahora,
+            "motivo_rearme": motivo,
+        }
+        if estado_anterior == "pendiente":
+            actualizacion["respondida_en"] = ahora
+            actualizacion["motivo_cierre"] = motivo
+
+        referencia.update(actualizacion)
+
+        decision_id = str(actual.get("decision_id") or "")
+        if decision_id:
+            historial = self._referencia_historial_alerta_ml(
+                firebase_db,
+                area,
+                aire,
+                decision_id,
+            )
+            if estado_anterior == "pendiente":
+                historial.update({**actual, **actualizacion})
+            else:
+                historial.update({
+                    "ciclo_cerrado_en": ahora,
+                    "motivo_rearme": motivo,
+                })
+
+        return {
+            "cerrada": True,
+            "motivo": motivo,
+            "decision_id": decision_id,
+            "estado_anterior": estado_anterior,
+        }
+
+    def registrar_alerta_ml_pendiente(
+        self,
+        firebase_db,
+        area: str,
+        aire: str,
+        accion: str,
+        *,
+        metadata: dict | None = None,
+        lectura: dict | None = None,
+        firebase_key: str | None = None,
+    ) -> dict:
+        accion_normalizada = self.normalizar_accion_comando(accion)
+        referencia = self._referencia_alerta_ml(firebase_db, area, aire)
+
+        if accion_es_no_op(accion_normalizada):
+            self.cerrar_alerta_ml_pendiente(
+                firebase_db,
+                area,
+                aire,
+                "el_modelo_ya_no_recomienda_una_accion_fisica",
+            )
+            return {
+                "creada": False,
+                "hay_pendiente": False,
+                "motivo": "decision_no_op",
+                "accion": accion_normalizada or "mantener",
+            }
+
+        if accion_normalizada not in ACCIONES_IR_RECONOCIDAS:
+            self.cerrar_alerta_ml_pendiente(
+                firebase_db,
+                area,
+                aire,
+                "la_accion_actual_no_es_ejecutable_por_ir",
+            )
+            return {
+                "creada": False,
+                "hay_pendiente": False,
+                "motivo": "accion_ir_no_reconocida",
+                "accion": accion_normalizada,
+            }
+
+        actual = self._leer_referencia_firebase(referencia) or {}
+        if not isinstance(actual, dict):
+            actual = {}
+
+        ahora_dt = datetime.now(timezone.utc)
+        ahora = ahora_dt.isoformat()
+        expira_en = (ahora_dt + timedelta(minutes=ALERTA_ML_TTL_MINUTOS)).isoformat()
+
+        misma_accion = (
+            self.normalizar_accion_comando(actual.get("accion"))
+            == accion_normalizada
+        )
+        estado_actual = str(actual.get("estado") or "").strip().lower()
+
+        if misma_accion and estado_actual == "pendiente":
+            actualizacion = {
+                "ultima_detectada_en": ahora,
+                "expira_en": expira_en,
+                "firebase_key_usado": firebase_key,
+                **(metadata or {}),
+            }
+            if lectura:
+                actualizacion["lectura_contexto"] = lectura
+
+            referencia.update(actualizacion)
+
+            decision_id = str(actual.get("decision_id") or "")
+            if decision_id:
+                self._referencia_historial_alerta_ml(
+                    firebase_db,
+                    area,
+                    aire,
+                    decision_id,
+                ).update(actualizacion)
+
+            return {
+                "creada": False,
+                "hay_pendiente": True,
+                "motivo": "decision_pendiente_ya_existente",
+                "decision_id": decision_id or None,
+                "accion": accion_normalizada,
+            }
+
+        if misma_accion and estado_actual in {"aceptada", "rechazada"}:
+            return {
+                "creada": False,
+                "hay_pendiente": False,
+                "motivo": f"decision_ya_{estado_actual}",
+                "decision_id": actual.get("decision_id"),
+                "accion": accion_normalizada,
+            }
+
+        decision_id = str(uuid4())
+        datos = {
+            "decision_id": decision_id,
+            "estado": "pendiente",
+            "origen": "modelo_ml",
+            "area": area,
+            "aire": aire,
+            "accion": accion_normalizada,
+            "creada_en": ahora,
+            "ultima_detectada_en": ahora,
+            "expira_en": expira_en,
+            "firebase_key_usado": firebase_key,
+            **(metadata or {}),
+        }
+        if lectura:
+            datos["lectura_contexto"] = lectura
+
+        referencia.update(datos)
+        self._referencia_historial_alerta_ml(
+            firebase_db,
+            area,
+            aire,
+            decision_id,
+        ).update(datos)
+
+        return {
+            "creada": True,
+            "hay_pendiente": True,
+            "motivo": "pendiente_aprobacion_humana",
+            "decision_id": decision_id,
+            "accion": accion_normalizada,
+        }
+
+    def rechazar_decision_ml_pendiente(
+        self,
+        area: str,
+        aire: str,
+        decision_id: str,
+        usuario: dict,
+        motivo: str | None = None,
+    ) -> dict:
+        firebase_db = obtener_firebase()
+        referencia = self._referencia_alerta_ml(firebase_db, area, aire)
+        actual = self._leer_referencia_firebase(referencia) or {}
+
+        if not isinstance(actual, dict) or not actual:
+            raise ValueError("No existe una decisión ML pendiente.")
+
+        if str(actual.get("decision_id") or "") != str(decision_id or ""):
+            raise ValueError(
+                "La decisión pendiente cambió. Actualiza la página e inténtalo de nuevo."
+            )
+
+        if actual.get("estado") != "pendiente":
+            raise ValueError("La decisión ML ya no está pendiente.")
+
+        ahora = self._fecha_iso_utc()
+        actualizacion = {
+            "estado": "rechazada",
+            "respondida_en": ahora,
+            "respondida_por_id": usuario.get("id"),
+            "respondida_por_nombre": usuario.get("nombre"),
+            "respondida_por_rol": usuario.get("rol"),
+            "motivo_cierre": motivo or "rechazada_por_usuario",
+        }
+        referencia.update(actualizacion)
+        self._referencia_historial_alerta_ml(
+            firebase_db,
+            area,
+            aire,
+            decision_id,
+        ).update({**actual, **actualizacion})
+
+        return {
+            "ok": True,
+            "estado": "rechazada",
+            "decision_id": decision_id,
+            "accion": actual.get("accion"),
+            "firebase_escrito": False,
+            "mensaje": "Decisión rechazada. No se envió ningún comando a Firebase.",
+        }
+
+    def aceptar_decision_ml_pendiente(
+        self,
+        area: str,
+        aire: str,
+        decision_id: str,
+        usuario: dict,
+    ) -> dict:
+        firebase_db = obtener_firebase()
+        referencia = self._referencia_alerta_ml(firebase_db, area, aire)
+        actual = self._leer_referencia_firebase(referencia) or {}
+
+        if not isinstance(actual, dict) or not actual:
+            raise ValueError("No existe una decisión ML pendiente.")
+
+        if str(actual.get("decision_id") or "") != str(decision_id or ""):
+            raise ValueError(
+                "La decisión pendiente cambió. Actualiza la página e inténtalo de nuevo."
+            )
+
+        if actual.get("estado") != "pendiente":
+            raise ValueError("La decisión ML ya no está pendiente.")
+
+        expira_en = self._parsear_iso_utc(actual.get("expira_en"))
+        if expira_en is not None and datetime.now(timezone.utc) > expira_en:
+            self.cerrar_alerta_ml_pendiente(
+                firebase_db,
+                area,
+                aire,
+                "decision_expirada_sin_respuesta",
+            )
+            raise ValueError(
+                "La decisión expiró. Espera una nueva recomendación del Machine Learning."
+            )
+
+        accion = self.normalizar_accion_comando(actual.get("accion"))
+        if accion not in ACCIONES_IR_RECONOCIDAS:
+            raise ValueError(
+                "La acción de la decisión ya no es válida para el control IR."
+            )
+
+        publicacion = self.publicar_comando_si_cambio(
+            firebase_db,
+            area,
+            aire,
+            accion,
+            {
+                "origen": "modelo_ml_aprobado",
+                "decision_ml_id": decision_id,
+                "aprobado_por_id": usuario.get("id"),
+                "aprobado_por_nombre": usuario.get("nombre"),
+                "aprobado_por_rol": usuario.get("rol"),
+                "modelo_usado": actual.get("modelo_usado"),
+                "tipo_modelo": actual.get("tipo_modelo"),
+                "version_modelo": actual.get("version_modelo"),
+                "prediccion_modelo": actual.get("prediccion_modelo"),
+                "recomendacion_ml": actual.get("recomendacion_ml"),
+                "accion_solicitada": accion,
+                "confianza_ml": actual.get("confianza_ml"),
+                "estado_electrico_observado": actual.get("estado_electrico_observado"),
+                "compresor_confirmado": actual.get("compresor_confirmado"),
+            },
+            permitir_publicacion=True,
+        )
+
+        aceptada = bool(
+            publicacion.get("publicado")
+            or publicacion.get("motivo") == "accion_sin_cambios"
+        )
+
+        if not aceptada:
+            referencia.update({
+                "ultimo_error_envio": publicacion.get("motivo"),
+                "ultimo_intento_envio_en": self._fecha_iso_utc(),
+            })
+            return {
+                "ok": False,
+                "estado": "pendiente",
+                "decision_id": decision_id,
+                "accion": accion,
+                "firebase_escrito": False,
+                "publicacion_comando": publicacion,
+                "mensaje": (
+                    "La decisión sigue pendiente porque ATMOS no pudo publicar "
+                    "el comando de forma segura."
+                ),
+            }
+
+        ahora = self._fecha_iso_utc()
+        actualizacion = {
+            "estado": "aceptada",
+            "respondida_en": ahora,
+            "respondida_por_id": usuario.get("id"),
+            "respondida_por_nombre": usuario.get("nombre"),
+            "respondida_por_rol": usuario.get("rol"),
+            "motivo_cierre": (
+                "comando_publicado_en_firebase"
+                if publicacion.get("publicado")
+                else "comando_ya_vigente_en_firebase"
+            ),
+            "command_id": publicacion.get("command_id"),
+        }
+        referencia.update(actualizacion)
+        self._referencia_historial_alerta_ml(
+            firebase_db,
+            area,
+            aire,
+            decision_id,
+        ).update({**actual, **actualizacion, "publicacion_comando": publicacion})
+
+        return {
+            "ok": True,
+            "estado": "aceptada",
+            "decision_id": decision_id,
+            "accion": accion,
+            "firebase_escrito": bool(publicacion.get("publicado")),
+            "publicacion_comando": publicacion,
+            "mensaje": (
+                "Decisión aceptada. El comando fue enviado a Firebase."
+                if publicacion.get("publicado")
+                else "Decisión aceptada. El mismo comando ya estaba vigente en Firebase."
+            ),
         }
 
 
@@ -286,26 +754,93 @@ class ServicioPredictor:
         confianza_ml = max(probabilidades.values()) if probabilidades else None
         ruta_comando = f"/Atmos/comandos/{area}/{aire}"
         control = (resultado or {}).get("control") or {}
-        permitir_publicacion = bool(
+        estado_electrico = evaluar_estado_electrico(lectura)
+        estado_observado = estado_electrico["estado_electrico"]
+        autorizacion_automatica = evaluar_autorizacion_automatica(
+            accion,
+            estado_observado,
+        )
+        requiere_aprobacion_humana = bool(
             control.get("ejecutar_ir") and accion != "mantener"
+            and autorizacion_automatica["autorizada"]
         )
 
-        publicacion_comando = self.publicar_comando_si_cambio(
-            firebase_db,
-            area,
-            aire,
-            accion,
-            {
-                "origen": "modelo_ml",
-                "modelo_usado": bool((modelo_ml or {}).get("modelo_usado")),
-                "tipo_modelo": (modelo_ml or {}).get("tipo_modelo"),
-                "version_modelo": (modelo_ml or {}).get("version_modelo"),
-                "prediccion_modelo": (modelo_ml or {}).get("prediccion_modelo"),
-                "recomendacion_ml": accion,
-                "confianza_ml": confianza_ml,
-            },
-            permitir_publicacion=permitir_publicacion,
-        )
+        metadata_alerta_ml = {
+            "modelo_usado": bool((modelo_ml or {}).get("modelo_usado")),
+            "tipo_modelo": (modelo_ml or {}).get("tipo_modelo"),
+            "version_modelo": (modelo_ml or {}).get("version_modelo"),
+            "prediccion_modelo": (modelo_ml or {}).get("prediccion_modelo"),
+            "recomendacion_ml": control.get("decision_final"),
+            "accion_solicitada": accion,
+            "confianza_ml": confianza_ml,
+            "estado_electrico_observado": estado_observado,
+            "compresor_confirmado": estado_electrico["compresor_confirmado"],
+        }
+
+        if requiere_aprobacion_humana:
+            alerta_ml = self.registrar_alerta_ml_pendiente(
+                firebase_db,
+                area,
+                aire,
+                accion,
+                metadata=metadata_alerta_ml,
+                lectura={
+                    "temperatura_ambiente": (
+                        lectura.get("temp_ambiente")
+                        or lectura.get("temperatura_ambiente")
+                        or lectura.get("temperatura")
+                    ),
+                    "temperatura_salida_aire": (
+                        lectura.get("temp_ac")
+                        or lectura.get("temperatura_salida_aire")
+                        or lectura.get("temperatura_salida")
+                    ),
+                    "humedad": lectura.get("humedad"),
+                    "presencia": datos_atmos.get("presencia"),
+                    "potencia_w": (
+                        lectura.get("potencia_w")
+                        or lectura.get("potencia_activa_w")
+                    ),
+                },
+                firebase_key=seleccion.get("firebase_key"),
+            )
+            publicacion_comando = {
+                "publicado": False,
+                "motivo": "pendiente_aprobacion_humana",
+                "accion_solicitada": accion,
+                "decision_id": alerta_ml.get("decision_id"),
+            }
+        else:
+            self.cerrar_alerta_ml_pendiente(
+                firebase_db,
+                area,
+                aire,
+                (
+                    "el_modelo_ya_no_requiere_accion_fisica"
+                    if accion_es_no_op(accion)
+                    else "la_capa_de_seguridad_no_autoriza_ejecutar_la_accion"
+                ),
+            )
+            alerta_ml = {
+                "creada": False,
+                "hay_pendiente": False,
+                "motivo": (
+                    "decision_no_op"
+                    if accion_es_no_op(accion)
+                    else "accion_bloqueada_por_seguridad"
+                ),
+                "accion": accion,
+            }
+            publicacion_comando = {
+                "publicado": False,
+                "motivo": (
+                    "decision_no_op"
+                    if accion_es_no_op(accion)
+                    else "control_sin_envio_ir"
+                ),
+                "accion_solicitada": accion,
+            }
+
         if resultado and resultado.get("control"):
             resultado["control"]["accion_enviada"] = bool(
                 resultado["control"].get("ejecutar_ir") and accion != "mantener"
@@ -317,6 +852,7 @@ class ServicioPredictor:
             accion=accion,
             resultado=resultado,
             horario=horario,
+            comando_publicado=publicacion_comando.get("publicado") is True,
         )
         prediccion_guardada = self.guardar_prediccion_modelo_valida(
             pabellon=area,
@@ -343,6 +879,10 @@ class ServicioPredictor:
             "modelo_ml": modelo_ml,
             "accion": accion,
             "publicacion_comando": publicacion_comando,
+            "requiere_aprobacion_humana": requiere_aprobacion_humana,
+            "alerta_ml": alerta_ml,
+            "estado_electrico": estado_electrico,
+            "autorizacion_automatica": autorizacion_automatica,
             "horario": horario,
             "ruta_comando": ruta_comando,
             "ruta_accion": f"/Atmos/comandos/{area}/{aire}/accion",
@@ -776,7 +1316,7 @@ class ServicioPredictor:
             return "mantener"
 
         if decision == "mantener":
-            return "ahorro_24" if temperatura_objetivo == 24 else "mantener"
+            return "mantener"
 
         if decision == "enfriar_fuerte":
             return "encender_22" if temperatura_objetivo == 22 else "enfriar_fuerte"
@@ -862,6 +1402,7 @@ class ServicioPredictor:
         accion: str,
         resultado: dict | None,
         horario: dict,
+        comando_publicado: bool = False,
     ) -> dict:
         cliente = obtener_cliente()
         respuesta = (
@@ -882,14 +1423,17 @@ class ServicioPredictor:
             decision_ml = (resultado.get("modelo") or {}).get("decision_ml")
             decision_final = (resultado.get("control") or {}).get("decision_final")
 
-        datos = {
-            "ultima_accion_ejecutada": accion,
-            "recomendacion_local": (
+        recomendacion = (
                 decision_final
                 or decision_ml
                 or ("fuera_horario_apagar" if not horario["dentro_horario"] else accion)
-            ),
+        )
+        datos = {
+            "recomendacion_local": recomendacion,
+            "estado_deseado": estado_deseado_desde_accion(accion),
         }
+        if comando_publicado:
+            datos["ultimo_comando_enviado"] = accion
 
         registro_actual = respuesta.data[0]
         registro_id = registro_actual["id"]
@@ -1032,9 +1576,14 @@ class ServicioPredictor:
         probabilidades = modelo_ml.get("probabilidades") or {}
         confianza = max(probabilidades.values()) if probabilidades else None
         instantanea = {
+            "pabellon": pabellon,
+            "aire": aire,
             "features_usadas": modelo_ml.get("features_usadas"),
             "prediccion_modelo": modelo_ml.get("prediccion_modelo"),
             "probabilidades": probabilidades,
+            "tipo_modelo": modelo_ml.get("tipo_modelo"),
+            "recomendacion_final": ((resultado or {}).get("control") or {}).get("decision_final"),
+            "accion_solicitada": accion,
             "accion_final": accion,
             "fuente": "modelo_pkl",
             "motivo_reglas_seguridad": (
@@ -1049,7 +1598,8 @@ class ServicioPredictor:
             "version_modelo": VERSION_MODELO_ATMOS,
             "instantanea_caracteristicas": instantanea,
             "ahorro_real_pct": None,
-            "fue_aplicado": actualizacion_supabase.get("actualizado") is True,
+            # Guardar una recomendación no significa crear, enviar ni ejecutar IR.
+            "fue_aplicado": False,
             "predicho_en": datetime.now(timezone.utc).isoformat(),
         }
         respuesta = obtener_cliente().table("ml_predictions").insert(registro).execute()
@@ -1311,7 +1861,7 @@ class ServicioPredictor:
                 "temperatura_promedio": round(sum(temperaturas) / len(temperaturas), 2) if temperaturas else 0.0,
                 "humedad_promedio": round(sum(humedades) / len(humedades), 2) if humedades else 0.0,
                 "razon_presencia": round(sum(presencias) / len(presencias), 4) if presencias else 0.0,
-                "potencia_promedio_w": round(sum(potencias) / len(potencias), 2) if potencias else 0.0,
+                "potencia_promedio_w": round(sum(potencias) / len(potencias), 2) if potencias else None,
                 "energia_total_kwh": round(max(0.0, energia_total), 6),
                 "dia_semana": cubo.weekday(),
                 "hora_del_dia": cubo.hour,

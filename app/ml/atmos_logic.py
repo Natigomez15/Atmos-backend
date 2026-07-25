@@ -312,11 +312,11 @@ def traducir_decision_ac(decision_final, temp_ambiente):
 
     elif decision_final == "mantener":
         return {
-            "estado_ac": "encendido",
-            "temperatura_objetivo": TEMP_MANTENER,
-            "modo": "cool",
-            "ventilacion": "automatica",
-            "accion": f"Mantener el aire acondicionado en {TEMP_MANTENER}°C"
+            "estado_ac": "sin cambio",
+            "temperatura_objetivo": None,
+            "modo": "sin cambio",
+            "ventilacion": "sin cambio",
+            "accion": "No enviar comando IR; conservar el estado observado"
         }
 
     elif decision_final == "enfriar_fuerte":
@@ -361,8 +361,8 @@ def obtener_comando_ir_sugerido(decision_final, accion_ac):
     if decision_final == "apagar":
         return COMANDO_IR_APAGAR
 
-    if decision_final == "mantener" and temperatura_objetivo == TEMP_MANTENER:
-        return COMANDO_IR_TEMP_24
+    if decision_final == "mantener":
+        return COMANDO_IR_NINGUNO
 
     if decision_final == "enfriar_fuerte" and temperatura_objetivo == TEMP_ENFRIAR_MODERADO:
         return COMANDO_IR_TEMP_23
@@ -406,6 +406,10 @@ def autorizar_control_ir(
     if decision_final == "esperar_apagado":
         ejecutar_ir = False
         motivos.append("No se envía IR porque el sistema está esperando completar el temporizador de ausencia.")
+
+    if decision_final == "mantener":
+        ejecutar_ir = False
+        motivos.append("Mantener es una decisión no-op: nunca genera una señal IR.")
 
     if comando_sugerido == COMANDO_IR_NINGUNO:
         ejecutar_ir = False

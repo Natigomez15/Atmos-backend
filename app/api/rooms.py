@@ -1,8 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.models.schemas import SalaCrear, SalaActualizar, SalaRespuesta
-from app.core.database import obtener_cliente, obtener_firebase
-from app.core.logger import log
+from app.core.database import obtener_cliente
 from app.core.security import requerir_admin
 
 enrutador = APIRouter(prefix="/salas", tags=["salas"])
@@ -19,36 +18,9 @@ def _resolver_pabellon_y_aire(sala: dict) -> tuple[str | None, str | None]:
 
 
 def _inicializar_comando_firebase(sala: dict) -> None:
-    pabellon, aire = _resolver_pabellon_y_aire(sala)
-    if not pabellon or not aire:
-        log.warning({
-            "evento": "sala_firebase_comando_no_inicializado",
-            "motivo": "No se pudo resolver pabellon/aire para inicializar comandos.",
-            "sala_id": str(sala.get("id")),
-            "pabellon": pabellon,
-            "aire": aire,
-        })
-        return
-
-    try:
-        firebase_db = obtener_firebase()
-        firebase_db.child("Atmos").child("comandos").child(pabellon).child(aire).update({
-            "accion": "mantener",
-        })
-        log.info({
-            "evento": "sala_firebase_comando_inicializado",
-            "sala_id": str(sala.get("id")),
-            "ruta": f"/Atmos/comandos/{pabellon}/{aire}/accion",
-            "accion": "mantener",
-        })
-    except Exception as error:
-        log.warning({
-            "evento": "sala_firebase_comando_error",
-            "sala_id": str(sala.get("id")),
-            "pabellon": pabellon,
-            "aire": aire,
-            "error": str(error),
-        })
+    # Crear una sala no debe crear ni sobrescribir una orden ejecutable.
+    # ``mantener`` es no-op y no se publica en la ruta de comandos.
+    return
 
 
 @enrutador.post("/", response_model=SalaRespuesta, status_code=201)

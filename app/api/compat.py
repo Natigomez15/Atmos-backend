@@ -18,6 +18,13 @@ from app.services.alert_service import ServicioAlertas
 from app.services.dashboard_energy import construir_resumen_dashboard, rango_dashboard, ahora_panama
 from app.services.sincronizador_firebase import leer_ultima_lectura_valida_firebase_rest
 from app.core.aires import es_aire_ignorado
+from app.core.control_ir import (
+    accion_es_no_op,
+    construir_comando_ir,
+    control_manual_ir_habilitado,
+    control_solo_manual,
+    motivo_bloqueo_control_manual_ir,
+)
 
 
 enrutador = APIRouter(tags=["compatibilidad"])
@@ -74,36 +81,57 @@ def _resolver_pabellon_y_aire(sala: dict, aire_param: Optional[str] = None) -> t
 
 
 def _inicializar_comando_sala_firebase(sala: dict) -> None:
-    pabellon, aire = _resolver_pabellon_y_aire(sala)
-    if not pabellon or not aire:
-        log.warning({
-            "evento": "room_firebase_comando_no_inicializado",
-            "motivo": "No se pudo resolver pabellon/aire para inicializar comandos.",
-            "sala_id": str(sala.get("id")),
-            "pabellon": pabellon,
-            "aire": aire,
-        })
-        return
+    # Una sala nueva no debe mutar el canal de órdenes. Mantener es no-op.
+    return
 
-    try:
-        firebase_db = obtener_firebase()
-        firebase_db.child("Atmos").child("comandos").child(pabellon).child(aire).update({
-            "accion": "mantener",
-        })
-        log.info({
-            "evento": "room_firebase_comando_inicializado",
-            "sala_id": str(sala.get("id")),
-            "ruta": f"/Atmos/comandos/{pabellon}/{aire}/accion",
-            "accion": "mantener",
-        })
-    except Exception as error:
-        log.warning({
-            "evento": "room_firebase_comando_error",
-            "sala_id": str(sala.get("id")),
-            "pabellon": pabellon,
-            "aire": aire,
-            "error": str(error),
-        })
+
+def _preparar_sobre_comando_manual(
+    payload: dict,
+    raw_payload: dict,
+    cliente=None,
+) -> dict:
+    pabellon = str(
+        raw_payload.get("pabellon")
+        or raw_payload.get("pavilion")
+        or raw_payload.get("edificio")
+        or ""
+    ).strip()
+    aire = str(
+        raw_payload.get("aire")
+        or raw_payload.get("ac")
+        or raw_payload.get("air")
+        or raw_payload.get("nombre_aire")
+        or ""
+    ).strip()
+
+    # Compatibilidad con clientes antiguos. Si el destino ya viene explícito,
+    # el canal operativo no depende de una consulta a Supabase.
+    if (not pabellon or not aire) and cliente is not None:
+        sala = _resolver_sala_para_comando(cliente, payload["sala_id"])
+        if sala:
+            pabellon_resuelto, aire_resuelto = _resolver_destino_firebase_comando(sala, raw_payload)
+            pabellon = pabellon or str(pabellon_resuelto or "").strip()
+            aire = aire or str(aire_resuelto or "").strip()
+    if not pabellon or not aire:
+        raise ValueError("pabellon y aire son obligatorios para enviar el comando a Firebase.")
+    accion = _traducir_comando_manual_a_accion_esp32(payload)
+    if accion_es_no_op(accion):
+        raise ValueError("La solicitud no contiene una acción IR explícita.")
+    return construir_comando_ir(
+        pabellon=pabellon,
+        aire=aire,
+        accion=accion,
+    )
+
+
+def _control_ir_inactivo_http() -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail={
+            "estado": "control_ir_bloqueado",
+            "motivo": motivo_bloqueo_control_manual_ir(),
+        },
+    )
 
 
 def _valor_ac_encendido_reporte(registro: dict):
@@ -373,9 +401,17 @@ def _resolver_destino_firebase_comando(
         or raw_payload.get("air")
         or raw_payload.get("nombre_aire")
     )
-    aires = sala.get("aires") or []
+    aires = [str(valor).strip() for valor in (sala.get("aires") or []) if str(valor).strip()]
     if aire_param:
-        aire = aire_param
+        aire = str(aire_param).strip()
+        if aires and aire not in aires:
+            raise ValueError(
+                f"El aire '{aire}' no pertenece a la sala solicitada."
+            )
+    elif len(aires) > 1:
+        raise ValueError(
+            "La sala tiene varios aires; el campo 'aire' es obligatorio."
+        )
     elif aires:
         aire = aires[0]
     else:
@@ -385,11 +421,10 @@ def _resolver_destino_firebase_comando(
 
 def _escribir_accion_manual_en_firebase(
     *,
-    cliente,
     payload: dict,
-    raw_payload: dict,
+    sobre_comando: dict,
 ) -> dict:
-    accion = _traducir_comando_manual_a_accion_esp32(payload)
+    accion = sobre_comando["accion"]
     resultado = {
         "accion_firebase": accion,
         "ruta_firebase": None,
@@ -399,40 +434,17 @@ def _escribir_accion_manual_en_firebase(
     }
 
     try:
-        sala = _resolver_sala_para_comando(cliente, payload["sala_id"])
-        if not sala:
-            resultado["advertencia_firebase"] = (
-                f"No se encontro sala {payload['sala_id']} en rooms; "
-                "comando guardado solo en Supabase."
-            )
-            log.warning({
-                "evento": "comando_manual_firebase_sala_no_encontrada",
-                "sala_id": str(payload["sala_id"]),
-                "accion": accion,
-            })
-            return resultado
-
-        pabellon, aire = _resolver_destino_firebase_comando(sala, raw_payload)
-        if not pabellon or not aire:
-            resultado["advertencia_firebase"] = (
-                "No se pudo resolver pabellon/aire desde rooms; "
-                "comando guardado solo en Supabase."
-            )
-            log.warning({
-                "evento": "comando_manual_firebase_destino_incompleto",
-                "sala_id": str(payload["sala_id"]),
-                "pabellon": pabellon,
-                "aire": aire,
-                "accion": accion,
-            })
-            return resultado
+        pabellon = sobre_comando["pabellon"]
+        aire = sobre_comando["aire"]
 
         ruta = f"/Atmos/comandos/{pabellon}/{aire}/accion"
         resultado["ruta_firebase"] = ruta
 
         firebase_db = obtener_firebase()
         firebase_db.child("Atmos").child("comandos").child(pabellon).child(aire).update({
-            "accion": accion,
+            **sobre_comando,
+            "actualizado_en": sobre_comando["created_at"],
+            "resultado": "pendiente",
         })
         resultado["firebase_escrito"] = True
         log.info({
@@ -743,27 +755,22 @@ async def resumen_pabellon(period_days: int = 1):
 
     respuesta = (
         cliente.table("registros")
-        .select("energia_kwh,potencia_w,fecha_sync")
+        .select(
+            "pabellon,aire,fecha_sync,potencia_w,potencia_activa_w,"
+            "consumo_intervalo_kwh,tarifa_kwh,costo_intervalo"
+        )
         .gte("fecha_sync", desde_iso)
         .execute()
     )
     filas = respuesta.data
-    energias = [fila["energia_kwh"] for fila in filas if fila.get("energia_kwh") is not None]
-    potencias = [fila["potencia_w"] for fila in filas if fila.get("potencia_w") is not None]
-
-    total_energy_kwh = (
-        max(energias) - min(energias)
-        if len(energias) >= 2
-        else (sum(potencias) / len(potencias) / 1000 * 24 if potencias else 0)
-    )
-    total_cost_usd = total_energy_kwh * TARIFA_KWH
+    resumen = _resumir_consumo_total_aires(filas)
 
     return {
-        "total_energy_kwh": total_energy_kwh,
-        "total_cost_usd": total_cost_usd,
+        "total_energy_kwh": resumen["total_energy_kwh"],
+        "total_cost_usd": resumen["total_cost_usd"],
         "total_savings_usd": 0,
         "avg_savings_pct": 0,
-        "rooms_count": 0,
+        "rooms_count": resumen["rooms_count"],
     }
 
 
@@ -880,42 +887,77 @@ async def listar_ac_commands(
 
 @enrutador.post("/ac-commands", status_code=201)
 async def crear_ac_command(request: Request):
+    if not control_manual_ir_habilitado():
+        raise _control_ir_inactivo_http()
     raw_payload = await request.json()
     payload = _normalizar_payload_comando(raw_payload)
+    if control_solo_manual() and payload.get("origen") != "manual":
+        raise HTTPException(status_code=403, detail="Solo se permiten comandos manuales explícitos.")
     if not payload.get("sala_id") or not payload.get("tipo_comando"):
         raise HTTPException(status_code=422, detail="Faltan room_id o command_type")
     if payload["tipo_comando"] == "setpoint" and payload.get("setpoint") is None:
         raise HTTPException(status_code=422, detail="setpoint es obligatorio")
 
+    try:
+        sobre_comando = _preparar_sobre_comando_manual(payload, raw_payload)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+    # Firebase es el canal operativo consumido por el ESP32. Se escribe antes
+    # del registro auxiliar y nunca depende de que Supabase esté disponible.
+    resultado_firebase = _escribir_accion_manual_en_firebase(
+        payload=payload,
+        sobre_comando=sobre_comando,
+    )
+    if not resultado_firebase["firebase_escrito"]:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "estado": "firebase_no_escrito",
+                "mensaje": "Firebase rechazó el comando; no se envió ninguna orden al ESP32.",
+                "motivo": resultado_firebase["error_firebase"],
+                "ruta": resultado_firebase["ruta_firebase"],
+            },
+        )
+
     datos = {
         **payload,
+        **sobre_comando,
         "fue_ejecutado": False,
         "ejecutado_en": None,
     }
-    cliente = obtener_cliente()
-    respuesta = cliente.table("ac_commands").insert(datos).execute()
-    if not respuesta.data:
-        raise HTTPException(status_code=400, detail="Error al crear comando")
-
-    comando_mapeado = _mapear_comando(respuesta.data[0])
-    resultado_firebase = _escribir_accion_manual_en_firebase(
-        cliente=cliente,
-        payload=payload,
-        raw_payload=raw_payload,
-    )
+    comando_mapeado = _mapear_comando(datos)
+    supabase_guardado = False
+    advertencia_supabase = None
+    try:
+        cliente = obtener_cliente()
+        respuesta = cliente.table("ac_commands").insert(datos).execute()
+        if respuesta.data:
+            comando_mapeado = _mapear_comando(respuesta.data[0])
+            supabase_guardado = True
+        else:
+            advertencia_supabase = "Supabase no devolvió el registro insertado."
+    except Exception as error:
+        advertencia_supabase = str(error)
+        log.warning({
+            "evento": "comando_manual_supabase_no_guardado",
+            "command_id": sobre_comando["command_id"],
+            "error": str(error),
+        })
     log.info({
         "evento": "comando_manual_guardado",
         "sala_id": str(payload["sala_id"]),
         "tipo_comando": payload["tipo_comando"],
         "setpoint": payload.get("setpoint"),
-        "supabase_guardado": True,
+        "supabase_guardado": supabase_guardado,
         "firebase_escrito": resultado_firebase["firebase_escrito"],
         "accion_firebase": resultado_firebase["accion_firebase"],
     })
     return {
         **comando_mapeado,
-        "command_saved_in_supabase": True,
-        "supabase_guardado": True,
+        "command_saved_in_supabase": supabase_guardado,
+        "supabase_guardado": supabase_guardado,
+        "advertencia_supabase": advertencia_supabase,
         **resultado_firebase,
     }
 
@@ -986,10 +1028,36 @@ async def reporte_energia(carga: dict | None = None):
                 "temperatura_c",
                 "temperatura_salida_aire_c",
                 "humedad_pct",
+                "delta_t_c",
                 "movimiento",
+                "estado_ocupacion",
+                "corriente_rms_a",
+                "corriente_rms_cruda_a",
+                "corriente_rms_instantanea_a",
+                "corriente_calculada_vpp",
+                "factor_calibracion_sct",
+                "ceros_consecutivos_sct",
+                "voltaje_red_v",
+                "factor_potencia",
+                "potencia_aparente_va",
+                "potencia_activa_w",
+                "potencia_activa_kw",
                 "potencia_w",
+                "consumo_intervalo_kwh",
+                "consumo_acumulado_sesion_kwh",
                 "energia_kwh",
+                "tarifa_kwh",
+                "costo_intervalo",
+                "costo_acumulado_sesion",
                 "ac_encendido",
+                "estado_electrico_observado",
+                "compresor_confirmado",
+                "dht_ok",
+                "ds18b20_ok",
+                "corriente_retenida_por_filtro",
+                "fallos_dht",
+                "fallos_ds18b20",
+                "control_ir_activo",
                 "recomendacion_local",
                 "ultima_accion_ejecutada",
             ],
@@ -1007,10 +1075,36 @@ async def reporte_energia(carga: dict | None = None):
                 "temperatura_c":  registro.get("temperatura_ambiente", ""),
                 "temperatura_salida_aire_c": registro.get("temperatura_salida_aire", ""),
                 "humedad_pct":    registro.get("humedad", ""),
+                "delta_t_c":      registro.get("delta_t", ""),
                 "movimiento":     _valor_movimiento_reporte(registro),
+                "estado_ocupacion": registro.get("estado_ocupacion", ""),
+                "corriente_rms_a": registro.get("corriente_rms", ""),
+                "corriente_rms_cruda_a": registro.get("corriente_rms_cruda", ""),
+                "corriente_rms_instantanea_a": registro.get("corriente_rms_instantanea", ""),
+                "corriente_calculada_vpp": registro.get("corriente_calculada_vpp", ""),
+                "factor_calibracion_sct": registro.get("factor_calibracion_sct", ""),
+                "ceros_consecutivos_sct": registro.get("ceros_consecutivos_sct", ""),
+                "voltaje_red_v": registro.get("voltaje_red_v", ""),
+                "factor_potencia": registro.get("factor_potencia", ""),
+                "potencia_aparente_va": registro.get("potencia_aparente_va", ""),
+                "potencia_activa_w": registro.get("potencia_activa_w", ""),
+                "potencia_activa_kw": registro.get("potencia_activa_kw", ""),
                 "potencia_w":     registro.get("potencia_w", ""),
+                "consumo_intervalo_kwh": registro.get("consumo_intervalo_kwh", ""),
+                "consumo_acumulado_sesion_kwh": registro.get("consumo_acumulado_sesion_kwh", ""),
                 "energia_kwh":    registro.get("energia_kwh", ""),
+                "tarifa_kwh": registro.get("tarifa_kwh", ""),
+                "costo_intervalo": registro.get("costo_intervalo", ""),
+                "costo_acumulado_sesion": registro.get("costo_acumulado_sesion", ""),
                 "ac_encendido":   _valor_ac_encendido_reporte(registro),
+                "estado_electrico_observado": registro.get("estado_electrico_observado", ""),
+                "compresor_confirmado": registro.get("compresor_confirmado", ""),
+                "dht_ok": registro.get("dht_ok", ""),
+                "ds18b20_ok": registro.get("ds18b20_ok", ""),
+                "corriente_retenida_por_filtro": registro.get("corriente_retenida_por_filtro", ""),
+                "fallos_dht": registro.get("fallos_dht", ""),
+                "fallos_ds18b20": registro.get("fallos_ds18b20", ""),
+                "control_ir_activo": registro.get("control_ir_activo", ""),
                 "recomendacion_local": registro.get("recomendacion_local", ""),
                 "ultima_accion_ejecutada": (
                     registro.get("ultima_accion_ejecutada")

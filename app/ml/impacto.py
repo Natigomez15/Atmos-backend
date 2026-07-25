@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.config import configuracion
+from app.core.control_ir import estado_deseado_desde_accion
 
 
 CONSUMO_AC_KW = 1.5
@@ -127,35 +128,44 @@ def inferir_accion(valor: dict[str, Any]) -> str:
     )
 
 
-def inferir_ac_encendido(valor: dict[str, Any], registro_anterior: dict[str, Any] | None = None) -> bool:
-    # La potencia activa es evidencia física y tiene prioridad sobre el comando
-    # solicitado. Se usa histéresis para ignorar ruido o consumo de standby.
+def evaluar_estado_electrico(valor: dict[str, Any]) -> dict[str, Any]:
+    """Evalúa telemetría sin declarar estados físicos antes de calibrar."""
     medicion = obtener_medicion_electrica_firebase(valor)
     potencia_activa_w = medicion["potencia_activa_w"]
-    if potencia_activa_w is not None:
-        if potencia_activa_w >= configuracion.AC_POWER_ON_THRESHOLD_W:
-            return True
-        if potencia_activa_w <= configuracion.AC_POWER_OFF_THRESHOLD_W:
-            return False
-        if registro_anterior and registro_anterior.get("aire_encendido_atmos") is not None:
-            return bool(registro_anterior["aire_encendido_atmos"])
+    if potencia_activa_w is None or configuracion.AC_POWER_THRESHOLDS_CALIBRATED is not True:
+        return {
+            "estado_electrico": "no_confirmado",
+            "compresor_confirmado": False,
+            "potencia_activa_w": potencia_activa_w,
+            "umbrales_calibrados": False,
+        }
+    if potencia_activa_w < configuracion.AC_POWER_OFF_THRESHOLD_W:
+        estado = "apagado"
+    elif potencia_activa_w >= configuracion.AC_POWER_ON_THRESHOLD_W:
+        estado = "encendido"
+    else:
+        estado = "no_confirmado"
+    return {
+        "estado_electrico": estado,
+        "compresor_confirmado": (
+            potencia_activa_w >= configuracion.AC_COMPRESSOR_ON_THRESHOLD_W
+        ),
+        "potencia_activa_w": potencia_activa_w,
+        "umbrales_calibrados": True,
+    }
 
-    estado_explicito = _a_bool(
-        valor.get("aire_encendido_atmos", valor.get("ac_encendido", valor.get("estado_ac")))
-    )
-    if estado_explicito is not None:
-        return estado_explicito
 
-    accion = inferir_accion(valor)
-    if accion in ACCIONES_APAGADO:
-        return False
-    if accion in ACCIONES_ENCENDIDO:
+def inferir_ac_encendido(
+    valor: dict[str, Any],
+    registro_anterior: dict[str, Any] | None = None,
+) -> bool | None:
+    """Compatibilidad: solo responde cuando la evidencia eléctrica lo confirma."""
+    estado = evaluar_estado_electrico(valor)["estado_electrico"]
+    if estado == "encendido":
         return True
-
-    if registro_anterior and registro_anterior.get("potencia_w") is not None:
-        return float(registro_anterior["potencia_w"]) >= configuracion.AC_POWER_ON_THRESHOLD_W
-
-    return False
+    if estado == "apagado":
+        return False
+    return None
 
 
 def estimar_consumo_registro(
@@ -163,13 +173,15 @@ def estimar_consumo_registro(
     registro_anterior: dict[str, Any] | None,
     fecha_actual: datetime,
 ) -> dict[str, float]:
-    ac_encendido = inferir_ac_encendido(valor, registro_anterior)
+    estado_software = _a_bool(
+        valor.get("aire_encendido_atmos", valor.get("ac_encendido", valor.get("estado_ac")))
+    )
     medicion = obtener_medicion_electrica_firebase(valor)
     potencia_medida_w = medicion["potencia_activa_w"]
     potencia_w = (
         potencia_medida_w
         if potencia_medida_w is not None
-        else CONSUMO_AC_KW * CANTIDAD_AIRES * 1000 if ac_encendido else 0.0
+        else CONSUMO_AC_KW * CANTIDAD_AIRES * 1000 if estado_software is True else 0.0
     )
 
     energia_anterior = 0.0

@@ -41,9 +41,15 @@ def _crear_mock_supabase() -> MagicMock:
 
 @pytest.fixture
 def mock_supabase(monkeypatch) -> MagicMock:
-    """Reemplaza obtener_cliente() con un mock en todos los módulos."""
+    """Evita conexiones reales a Supabase durante las pruebas."""
     mock = _crear_mock_supabase()
+
+    # La funcion obtener_cliente() usa esta cache interna.
+    # Al colocar aqui el mock tambien cubrimos modulos que importaron
+    # obtener_cliente antes de que pytest aplicara el fixture.
+    monkeypatch.setattr("app.core.database._cliente_supabase", mock)
     monkeypatch.setattr("app.core.database.obtener_cliente", lambda: mock)
+
     return mock
 
 

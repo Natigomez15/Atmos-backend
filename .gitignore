@@ -1,4 +1,5 @@
 .env
+.env.runtime
 serviceAccountKey.json
 .venv/
 .venv-local/
@@ -16,3 +17,8 @@ logs/
 *.log
 private_key.pem
 public_key.pem
+
+# Backups locales
+*.bak
+*.bak_*
+*.backup

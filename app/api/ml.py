@@ -1,5 +1,7 @@
+import httpx
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Header, Request
-from typing import Annotated, Optional
+from typing import Annotated, Literal, Optional
 from uuid import UUID
 from pydantic import BaseModel, Field
 
@@ -8,7 +10,12 @@ from app.ml.impacto import resumir_impacto_decisiones, resumir_impacto_real
 from app.core.database import obtener_cliente
 from app.config import configuracion
 from app.core.limiter import limitador
-from app.core.security import requerir_admin
+from app.core.security import requerir_admin, requerir_mantenimiento_o_admin
+from app.services.sincronizador_firebase import (
+    leer_comando_firebase_rest,
+    normalizar_pabellon_firebase,
+    normalizar_ultima_decision_firebase,
+)
 
 enrutador = APIRouter(prefix="/ml", tags=["ml"])
 
@@ -49,6 +56,66 @@ class EntradaAtmosFirebase(BaseModel):
     aire: str = "Aire_1"
 
 
+class RespuestaDecisionML(BaseModel):
+    decision_id: str
+    area: str = "robotica"
+    aire: str = "Aire_1"
+    motivo: Optional[str] = None
+
+
+class PrediccionDecisionFirebase(BaseModel):
+    valor: Optional[str] = None
+    confianza: Optional[Annotated[float, Field(ge=0.0, le=1.0)]] = None
+    modelo_usado: Optional[bool] = None
+    origen: Optional[str] = None
+    tipo_modelo: Optional[str] = None
+    version_modelo: Optional[str] = None
+
+
+class RecomendacionDecisionFirebase(BaseModel):
+    recomendacion_final: Optional[str] = None
+    accion_solicitada: Optional[str] = None
+    modificada_por_reglas: bool
+    motivo: Optional[str] = None
+
+
+class EjecucionDecisionFirebase(BaseModel):
+    ultima_accion: Optional[str] = None
+    temperatura: Optional[float] = None
+    estado: Literal[
+        "sin_registro",
+        "pendiente",
+        "senal_enviada",
+        "enviada_sin_confirmacion",
+        "confirmada",
+        "fallida",
+        "inconsistente",
+    ]
+    mensaje: str
+    resultado_raw: Optional[str] = None
+    confirmacion_ir_raw: Optional[str] = None
+    firma: Optional[str] = None
+
+
+class EstadoControlFirebase(BaseModel):
+    estado_deseado: Optional[str] = None
+    ultimo_comando_enviado: Optional[str] = None
+    estado_reportado_por_software: str
+    estado_electrico_observado: Literal["encendido", "apagado", "no_confirmado"]
+    compresor_confirmado: bool
+
+
+class UltimaDecisionFirebaseRespuesta(BaseModel):
+    pabellon: str
+    aire: str
+    actualizado_en: Optional[str] = None
+    prediccion: PrediccionDecisionFirebase
+    decision: RecomendacionDecisionFirebase
+    ejecucion: EjecucionDecisionFirebase
+    estado_control: EstadoControlFirebase
+    advertencias: list[str]
+
+
 def _mapear_prediccion(prediccion: dict) -> dict:
     instantanea = prediccion.get("instantanea_caracteristicas") or {}
     features_usadas = instantanea.get("features_usadas")
@@ -59,32 +126,56 @@ def _mapear_prediccion(prediccion: dict) -> dict:
             **instantanea,
             "features_usadas": features_usadas,
         }
+    prediccion_original = instantanea.get("prediccion_modelo")
+    recomendacion_final = instantanea.get("recomendacion_final")
+    if recomendacion_final is None:
+        recomendacion_final = instantanea.get("accion_final")
+    accion_solicitada = instantanea.get("accion_solicitada")
+    if accion_solicitada is None:
+        accion_solicitada = instantanea.get("accion_final")
+    recomendacion_modificada = (
+        prediccion_original is not None
+        and recomendacion_final is not None
+        and str(prediccion_original).strip().lower()
+        != str(recomendacion_final).strip().lower()
+    )
+    motivo_reglas = instantanea.get("motivo_reglas_seguridad")
     modelo_ml = {
         "modelo_disponible": True,
         "modelo_usado": instantanea.get("fuente") == "modelo_pkl",
-        "tipo_modelo": "RandomForestClassifier",
+        "tipo_modelo": instantanea.get("tipo_modelo"),
         "version_modelo": prediccion.get("version_modelo"),
         "features_usadas": features_usadas,
-        "prediccion_modelo": instantanea.get("prediccion_modelo"),
+        "prediccion_modelo": prediccion_original,
         "probabilidades": instantanea.get("probabilidades"),
         "accion_final": instantanea.get("accion_final"),
-        "motivo_reglas_seguridad": instantanea.get("motivo_reglas_seguridad"),
+        "recomendacion_final": recomendacion_final,
+        "accion_solicitada": accion_solicitada,
+        "motivo_reglas_seguridad": motivo_reglas,
     }
     # Confianza de la predicción (RandomForest.predict_proba): probabilidad de
     # la clase elegida. Se expone lista para el frontend ("Apagar aire —
     # confianza 87%").
     confianza = prediccion.get("puntaje_confianza")
     confianza_pct = round(float(confianza) * 100) if confianza is not None else None
-    texto_accion = _texto_accion(instantanea.get("accion_final"))
-    recomendacion_texto = (
-        f"{texto_accion} — confianza {confianza_pct}%"
-        if confianza_pct is not None
-        else texto_accion
-    )
+    texto_accion = _texto_accion(prediccion_original) if prediccion_original is not None else None
+    recomendacion_texto = None
+    if texto_accion is not None:
+        recomendacion_texto = (
+            f"{texto_accion} — confianza {confianza_pct}%"
+            if confianza_pct is not None
+            else texto_accion
+        )
     return {
+        **prediccion,
         "confianza_pct": confianza_pct,
         "recomendacion_texto": recomendacion_texto,
-        **prediccion,
+        "prediccion_original": prediccion_original,
+        "confianza_prediccion": confianza,
+        "recomendacion_final": recomendacion_final,
+        "accion_solicitada": accion_solicitada,
+        "recomendacion_modificada": recomendacion_modificada,
+        "motivo_reglas_seguridad": motivo_reglas,
         "room_id": prediccion.get("sala_id"),
         "recommended_setpoint": prediccion.get("setpoint_recomendado"),
         "predicted_savings_pct": prediccion.get("ahorro_predicho_pct"),
@@ -96,6 +187,55 @@ def _mapear_prediccion(prediccion: dict) -> dict:
         "predicted_at": prediccion.get("predicho_en"),
         "modelo_ml": modelo_ml,
     }
+
+
+@enrutador.get("/decisions/latest", response_model=UltimaDecisionFirebaseRespuesta)
+async def ultima_decision_firebase(
+    pabellon: Annotated[str, Query(min_length=1)],
+    aire: Annotated[str, Query(min_length=1)],
+):
+    pabellon_normalizado = normalizar_pabellon_firebase(pabellon)
+    aire_real = aire.strip()
+    if not pabellon_normalizado or not aire_real:
+        raise HTTPException(
+            status_code=422,
+            detail="Los parámetros pabellon y aire no pueden estar vacíos.",
+        )
+
+    try:
+        datos = leer_comando_firebase_rest(pabellon_normalizado, aire_real)
+    except httpx.HTTPStatusError as error:
+        if error.response.status_code == 404:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "No existe una decisión en Firebase para "
+                    f"/Atmos/comandos/{pabellon_normalizado}/{aire_real}."
+                ),
+            ) from error
+        raise HTTPException(
+            status_code=502,
+            detail="No se pudo leer la última decisión desde Firebase.",
+        ) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=502,
+            detail="No se pudo leer la última decisión desde Firebase.",
+        ) from error
+
+    if not datos:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "No existe una decisión en Firebase para "
+                f"/Atmos/comandos/{pabellon_normalizado}/{aire_real}."
+            ),
+        )
+    return normalizar_ultima_decision_firebase(
+        pabellon=pabellon_normalizado,
+        aire=aire_real,
+        datos=datos,
+    )
 
 
 def _mapear_caracteristica(fila: dict) -> dict:
@@ -153,6 +293,12 @@ def _fallback_prediccion_desde_registro(sala_id: UUID) -> dict:
             "recommended_setpoint": None,
             "predicted_savings_pct": None,
             "confidence_score": None,
+            "prediccion_original": None,
+            "confianza_prediccion": None,
+            "recomendacion_final": None,
+            "accion_solicitada": None,
+            "recomendacion_modificada": False,
+            "motivo_reglas_seguridad": None,
             "model_version": "motor_decision_atmos_v1",
             "modelo_ml": {
                 **info_modelo,
@@ -195,6 +341,12 @@ def _fallback_prediccion_desde_registro(sala_id: UUID) -> dict:
         "predicted_savings_pct": None,
         "ahorro_predicho_pct": None,
         "confidence_score": None,
+        "prediccion_original": None,
+        "confianza_prediccion": None,
+        "recomendacion_final": None,
+        "accion_solicitada": None,
+        "recomendacion_modificada": False,
+        "motivo_reglas_seguridad": None,
         "puntaje_confianza": None,
         "model_version": "motor_decision_atmos_v1",
         "version_modelo": "motor_decision_atmos_v1",
@@ -263,6 +415,73 @@ async def decidir_atmos_desde_firebase(
         )
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error))
+
+
+
+@enrutador.get("/decisiones/pendiente")
+async def obtener_decision_ml_pendiente(
+    area: str = "robotica",
+    aire: str = "Aire_1",
+):
+    area_limpia = area.strip()
+    aire_limpio = aire.strip()
+    if not area_limpia or not aire_limpio:
+        raise HTTPException(
+            status_code=422,
+            detail="area y aire son obligatorios",
+        )
+    try:
+        return ServicioPredictor().obtener_decision_ml_pendiente(
+            area=area_limpia,
+            aire=aire_limpio,
+        )
+    except Exception as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"No se pudo consultar la decisión ML pendiente: {error}",
+        ) from error
+
+
+@limitador.limit("20/minute")
+@enrutador.post("/decisiones/pendiente/aceptar")
+async def aceptar_decision_ml_pendiente(
+    request: Request,
+    entrada: RespuestaDecisionML,
+    usuario: dict = Depends(requerir_mantenimiento_o_admin),
+):
+    try:
+        resultado = ServicioPredictor().aceptar_decision_ml_pendiente(
+            area=entrada.area.strip(),
+            aire=entrada.aire.strip(),
+            decision_id=entrada.decision_id,
+            usuario=usuario,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+    if not resultado.get("ok"):
+        raise HTTPException(status_code=409, detail=resultado)
+
+    return resultado
+
+
+@limitador.limit("20/minute")
+@enrutador.post("/decisiones/pendiente/rechazar")
+async def rechazar_decision_ml_pendiente(
+    request: Request,
+    entrada: RespuestaDecisionML,
+    usuario: dict = Depends(requerir_mantenimiento_o_admin),
+):
+    try:
+        return ServicioPredictor().rechazar_decision_ml_pendiente(
+            area=entrada.area.strip(),
+            aire=entrada.aire.strip(),
+            decision_id=entrada.decision_id,
+            usuario=usuario,
+            motivo=entrada.motivo,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
 
 
 @limitador.limit("10/minute")

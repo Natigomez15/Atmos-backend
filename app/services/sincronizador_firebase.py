@@ -1,4 +1,6 @@
+import math
 import time
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import quote, urlencode
@@ -8,13 +10,14 @@ import httpx
 
 from app.config import configuracion
 from app.core.aires import es_aire_ignorado
+from app.core.control_ir import estado_deseado_desde_accion
 from app.core.database import obtener_cliente, obtener_firebase
 from app.ml.impacto import (
     ACCIONES_APAGADO,
     ACCIONES_ENCENDIDO,
     estimar_consumo_registro,
+    evaluar_estado_electrico,
     inferir_accion,
-    inferir_ac_encendido,
     obtener_medicion_electrica_firebase,
 )
 
@@ -24,6 +27,12 @@ MAX_LECTURAS_FIREBASE_POR_CONSULTA = 100
 
 CAMPOS_ELECTRICOS_FIREBASE = {
     "corriente_rms",
+    "corriente_rms_cruda",
+    "corriente_rms_instantanea",
+    "corriente_calculada_vpp",
+    "factor_calibracion_sct",
+    "corriente_retenida_por_filtro",
+    "ceros_consecutivos_sct",
     "voltaje_red_v",
     "factor_potencia",
     "potencia_aparente_va",
@@ -34,6 +43,18 @@ CAMPOS_ELECTRICOS_FIREBASE = {
     "tarifa_kwh",
     "costo_intervalo",
     "costo_acumulado_sesion",
+    "dht_ok",
+    "ds18b20_ok",
+    "fallos_dht",
+    "fallos_ds18b20",
+}
+
+CAMPOS_SEGURIDAD_REGISTROS = {
+    "estado_deseado",
+    "ultimo_comando_enviado",
+    "estado_reportado_por_software",
+    "estado_electrico_observado",
+    "compresor_confirmado",
 }
 
 
@@ -355,11 +376,16 @@ def preparar_registro_supabase(
         fecha_actual=fecha_sync,
     )
     medicion_electrica = obtener_medicion_electrica_firebase(valor)
+    estado_electrico = evaluar_estado_electrico(valor)
 
-    potencia_w = _a_numero(
-        valor.get("potencia_w", valor.get("power_w")),
-        defecto=None,
-    )
+    # La medición activa nueva tiene prioridad incluso cuando el firmware
+    # conserva un campo legado ``potencia_w: 0`` en la misma lectura.
+    potencia_w = medicion_electrica["potencia_activa_w"]
+    if potencia_w is None:
+        potencia_w = _a_numero(
+            valor.get("potencia_w", valor.get("power_w")),
+            defecto=None,
+        )
     energia_kwh = _a_numero(
         valor.get("energia_kwh", valor.get("energy_kwh")),
         defecto=None,
@@ -377,6 +403,15 @@ def preparar_registro_supabase(
         "temperatura_salida_aire": temperatura_salida_aire,
         "delta_t": delta_t,
         "movimiento": _a_entero(valor.get("movimiento")),
+        "corriente_rms_cruda": _a_numero(valor.get("corriente_rms_cruda"), defecto=None),
+        "corriente_rms_instantanea": _a_numero(valor.get("corriente_rms_instantanea"), defecto=None),
+        "corriente_calculada_vpp": _a_numero(valor.get("corriente_calculada_vpp"), defecto=None),
+        "factor_calibracion_sct": _a_numero(valor.get("factor_calibracion_sct"), defecto=None),
+        "corriente_retenida_por_filtro": (
+            _a_booleano(valor.get("corriente_retenida_por_filtro"))
+            if valor.get("corriente_retenida_por_filtro") is not None else None
+        ),
+        "ceros_consecutivos_sct": _a_entero(valor.get("ceros_consecutivos_sct"), defecto=None),
         "potencia_w": potencia_w if potencia_w is not None else consumo_estimado["potencia_w"],
         # Algunos nodos envian energia_kwh=0 aunque esten consumiendo potencia.
         # En ese caso se conserva la estimacion acumulada basada en potencia y tiempo.
@@ -393,8 +428,29 @@ def preparar_registro_supabase(
             valor.get("recomendacion", ""),
         ),
         "control_ir_activo": _a_booleano(valor.get("control_ir_activo", False)),
-        "aire_encendido_atmos": inferir_ac_encendido(valor, registro_anterior),
-        "ultima_accion_ejecutada": valor.get("ultima_accion_ejecutada", accion),
+        "dht_ok": _a_booleano(valor.get("dht_ok")) if valor.get("dht_ok") is not None else None,
+        "ds18b20_ok": _a_booleano(valor.get("ds18b20_ok")) if valor.get("ds18b20_ok") is not None else None,
+        "fallos_dht": _a_entero(valor.get("fallos_dht"), defecto=None),
+        "fallos_ds18b20": _a_entero(valor.get("fallos_ds18b20"), defecto=None),
+        # Campo legado: conserva únicamente lo reportado por software; nunca se
+        # usa como confirmación física ni se deriva de la acción deseada.
+        "aire_encendido_atmos": (
+            _a_booleano(valor.get("aire_encendido_atmos"))
+            if valor.get("aire_encendido_atmos") is not None
+            else None
+        ),
+        "estado_deseado": estado_deseado_desde_accion(accion),
+        "ultimo_comando_enviado": valor.get("ultima_accion_ejecutada"),
+        "estado_reportado_por_software": (
+            "encendido"
+            if _a_booleano(valor.get("aire_encendido_atmos"))
+            else "apagado"
+            if valor.get("aire_encendido_atmos") is not None
+            else "no_reportado"
+        ),
+        "estado_electrico_observado": estado_electrico["estado_electrico"],
+        "compresor_confirmado": estado_electrico["compresor_confirmado"],
+        "ultima_accion_ejecutada": valor.get("ultima_accion_ejecutada"),
         "fecha_sync": fecha_sync.isoformat(),
     }
     registro.update({
@@ -460,8 +516,230 @@ def leer_comando_firebase_rest(pabellon: str, aire: str) -> dict:
     return datos if isinstance(datos, dict) else {}
 
 
+ESTADOS_EJECUCION_FIREBASE = {
+    "sin_registro": "No existe un registro de comando en Firebase.",
+    "pendiente": "La acción está pendiente de envío o ejecución.",
+    "senal_enviada": "La señal infrarroja fue enviada.",
+    "enviada_sin_confirmacion": "Señal enviada, funcionamiento del aire no confirmado.",
+    "confirmada": "Ejecución infrarroja confirmada.",
+    "fallida": "La ejecución infrarroja falló.",
+    "inconsistente": "Firebase contiene estados de ejecución contradictorios.",
+}
+
+
+def _normalizar_token_decision(valor: Any) -> str:
+    texto = unicodedata.normalize("NFKD", str(valor or "").strip())
+    texto = "".join(caracter for caracter in texto if not unicodedata.combining(caracter))
+    return texto.lower().replace(" ", "_").replace("-", "_")
+
+
+def normalizar_pabellon_firebase(pabellon: str) -> str:
+    """Normaliza el segmento de Firebase sin alterar el identificador del aire."""
+    return _normalizar_token_decision(pabellon)
+
+
+def _numero_opcional(valor: Any) -> float | int | None:
+    if valor is None or isinstance(valor, bool):
+        return None
+    try:
+        numero = float(valor)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numero):
+        return None
+    return int(numero) if numero.is_integer() else numero
+
+
+def _confianza_opcional(valor: Any) -> float | None:
+    numero = _numero_opcional(valor)
+    if numero is None:
+        return None
+    confianza = float(numero)
+    return confianza if 0.0 <= confianza <= 1.0 else None
+
+
+def _booleano_opcional(valor: Any) -> bool | None:
+    if isinstance(valor, bool):
+        return valor
+    token = _normalizar_token_decision(valor)
+    if token in {"true", "1", "si"}:
+        return True
+    if token in {"false", "0", "no"}:
+        return False
+    return None
+
+
+def _clasificar_ejecucion_firebase(datos: dict) -> tuple[str, list[str]]:
+    """Clasifica la ejecución usando primero los estados más específicos.
+
+    Orden intencional:
+    1) contradicción confirmada/fallida;
+    2) señal explícitamente enviada sin confirmación;
+    3) fallo explícito;
+    4) confirmación explícita;
+    5) señal enviada;
+    6) pendiente o sin evidencia de envío.
+
+    Así, ``sin_confirmacion`` nunca se interpreta como ``confirmada`` por una
+    coincidencia parcial de texto.
+    """
+    resultado = _normalizar_token_decision(datos.get("resultado"))
+    confirmacion = _normalizar_token_decision(datos.get("confirmacion_ir"))
+
+    confirmacion_sin_respuesta = "sin_confirmacion" in confirmacion
+    confirmacion_fallida = any(
+        marcador in confirmacion
+        for marcador in {"fallida", "fallo", "error", "rechazada", "no_enviada"}
+    )
+    confirmacion_explicita = confirmacion in {
+        "confirmada",
+        "confirmado",
+        "ejecucion_confirmada",
+        "accion_confirmada",
+        "confirmacion_ir_exitosa",
+        "confirmada_por_el_aire",
+    }
+    senal_enviada = any(
+        marcador in confirmacion
+        for marcador in {"senal_ir_enviada", "senal_enviada", "enviada"}
+    )
+
+    resultado_fallido = any(
+        marcador in resultado
+        for marcador in {"fallida", "fallo", "error", "no_reconocida", "rechazada"}
+    )
+    resultado_exitoso = resultado in {
+        "ok",
+        "exito",
+        "exitosa",
+        "ejecutada",
+        "accion_ejecutada",
+        "confirmada",
+    }
+
+    advertencias: list[str] = []
+    if (confirmacion_explicita and resultado_fallido) or (
+        confirmacion_fallida and resultado_exitoso
+    ):
+        advertencias.append(
+            "El resultado y la confirmación infrarroja de Firebase son contradictorios."
+        )
+        return "inconsistente", advertencias
+    if confirmacion_sin_respuesta:
+        return "enviada_sin_confirmacion", advertencias
+    if confirmacion_fallida or resultado_fallido:
+        return "fallida", advertencias
+    if confirmacion_explicita:
+        return "confirmada", advertencias
+    if senal_enviada or resultado_exitoso or datos.get("firma_ejecutada"):
+        return "senal_enviada", advertencias
+    return "pendiente", advertencias
+
+
+def normalizar_ultima_decision_firebase(
+    pabellon: str,
+    aire: str,
+    datos: dict | None,
+) -> dict:
+    """Construye el contrato de lectura sin escribir ni completar datos ausentes."""
+    datos = datos if isinstance(datos, dict) else {}
+    estado, advertencias = (
+        _clasificar_ejecucion_firebase(datos)
+        if datos
+        else ("sin_registro", [])
+    )
+
+    prediccion_original = datos.get("prediccion_modelo")
+    recomendacion_final = datos.get("recomendacion_ml")
+    accion_solicitada = datos.get("accion")
+    ultima_accion = datos.get("ultima_accion_ejecutada")
+
+    if (
+        prediccion_original is not None
+        and recomendacion_final is not None
+        and _normalizar_token_decision(prediccion_original)
+        != _normalizar_token_decision(recomendacion_final)
+    ):
+        advertencias.append(
+            "La recomendación final es diferente de la predicción original."
+        )
+    if (
+        accion_solicitada is not None
+        and ultima_accion is not None
+        and _normalizar_token_decision(accion_solicitada)
+        != _normalizar_token_decision(ultima_accion)
+    ):
+        advertencias.append(
+            "La acción solicitada es diferente de la última acción enviada."
+        )
+    if "no_reconocida" in _normalizar_token_decision(datos.get("resultado")):
+        advertencias.append(
+            "Firebase contiene un resultado de acción no reconocida."
+        )
+    if (
+        datos.get("confianza_ml") is not None
+        and _confianza_opcional(datos.get("confianza_ml")) is None
+    ):
+        advertencias.append("La confianza de Firebase está fuera del rango válido de 0 a 1.")
+
+    motivo = datos.get("motivo_reglas_seguridad")
+    if motivo is None:
+        motivo = datos.get("motivo")
+    estado_electrico = evaluar_estado_electrico(datos)
+    estado_software_raw = datos.get("aire_encendido_atmos")
+    estado_software = (
+        "encendido"
+        if estado_software_raw is not None and _a_booleano(estado_software_raw)
+        else "apagado"
+        if estado_software_raw is not None
+        else "no_reportado"
+    )
+
+    return {
+        "pabellon": normalizar_pabellon_firebase(pabellon),
+        "aire": str(aire).strip(),
+        "actualizado_en": datos.get("actualizado_en"),
+        "prediccion": {
+            "valor": prediccion_original,
+            "confianza": _confianza_opcional(datos.get("confianza_ml")),
+            "modelo_usado": _booleano_opcional(datos.get("modelo_usado")),
+            "origen": datos.get("origen"),
+            "tipo_modelo": datos.get("tipo_modelo"),
+            "version_modelo": datos.get("version_modelo"),
+        },
+        "decision": {
+            "recomendacion_final": recomendacion_final,
+            "accion_solicitada": accion_solicitada,
+            "modificada_por_reglas": (
+                prediccion_original is not None
+                and recomendacion_final is not None
+                and _normalizar_token_decision(prediccion_original)
+                != _normalizar_token_decision(recomendacion_final)
+            ),
+            "motivo": motivo,
+        },
+        "ejecucion": {
+            "ultima_accion": ultima_accion,
+            "temperatura": _numero_opcional(datos.get("temperatura_ejecutada")),
+            "estado": estado,
+            "mensaje": ESTADOS_EJECUCION_FIREBASE[estado],
+            "resultado_raw": datos.get("resultado"),
+            "confirmacion_ir_raw": datos.get("confirmacion_ir"),
+            "firma": datos.get("firma_ejecutada"),
+        },
+        "estado_control": {
+            "estado_deseado": estado_deseado_desde_accion(accion_solicitada),
+            "ultimo_comando_enviado": ultima_accion,
+            "estado_reportado_por_software": estado_software,
+            "estado_electrico_observado": estado_electrico["estado_electrico"],
+            "compresor_confirmado": estado_electrico["compresor_confirmado"],
+        },
+        "advertencias": advertencias,
+    }
+
+
 def aplicar_estado_comando_firebase(valor: dict, pabellon: str, aire: str) -> dict:
-    """Usa /Atmos/comandos como fuente de verdad del estado ejecutado del AC."""
+    """Anexa intención/comando; nunca lo presenta como estado físico ejecutado."""
     try:
         comando = leer_comando_firebase_rest(pabellon, aire)
     except Exception:
@@ -473,8 +751,8 @@ def aplicar_estado_comando_firebase(valor: dict, pabellon: str, aire: str) -> di
 
     return {
         **valor,
-        "aire_encendido_atmos": accion in ACCIONES_ENCENDIDO,
-        "ultima_accion_ejecutada": accion,
+        "estado_deseado": estado_deseado_desde_accion(accion),
+        "ultimo_comando_enviado": accion,
     }
 
 
@@ -496,15 +774,14 @@ def guardar_registro_supabase_rest(registro: dict) -> dict:
         "Prefer": "resolution=merge-duplicates,return=representation",
     }
     respuesta = httpx.post(url, headers=headers, json=registro, timeout=8)
-    if respuesta.status_code == 400 and any(
-        campo in respuesta.text for campo in CAMPOS_ELECTRICOS_FIREBASE
-    ):
+    if respuesta.status_code == 400:
         # Compatibilidad mientras se aplica la migración de columnas. Los
         # campos potencia_w y energia_kwh ya contienen la medición normalizada.
         registro_compatible = {
             campo: valor
             for campo, valor in registro.items()
             if campo not in CAMPOS_ELECTRICOS_FIREBASE
+            and campo not in CAMPOS_SEGURIDAD_REGISTROS
         }
         respuesta = httpx.post(url, headers=headers, json=registro_compatible, timeout=8)
     respuesta.raise_for_status()
@@ -598,22 +875,6 @@ def sincronizar_firebase_supabase(
                 "duracion_total_ms": round((time.monotonic() - inicio_total) * 1000, 2),
             }
 
-        llave_completa = f"{pabellon_objetivo}_{aire_objetivo}_{seleccion['firebase_key']}"
-        if obtener_registro_por_firebase_key(llave_completa):
-            return {
-                "sincronizados": 0,
-                "errores": 0,
-                "detalles_errores": [],
-                "lectura_valida": True,
-                "lecturas_invalidas_ignoradas": seleccion["lecturas_invalidas_ignoradas"],
-                "firebase_key_usado": llave_completa,
-                "diagnostico": seleccion["diagnostico"],
-                "advertencias": seleccion["advertencias"],
-                "mensaje": "La lectura ya estaba sincronizada en Supabase.",
-                "etapas": etapas,
-                "duracion_total_ms": round((time.monotonic() - inicio_total) * 1000, 2),
-            }
-
         datos = {
             pabellon_objetivo: {
                 aire_objetivo: {"lecturas": lecturas or {}}
@@ -666,13 +927,35 @@ def sincronizar_firebase_supabase(
                 nodo_id = _a_uuid(valor.get("nodo_id"))
                 firebase_key_unica = f"{pabellon}_{aire}_{firebase_key}"
 
-                if obtener_registro_por_firebase_key(firebase_key_unica):
-                    duplicados_ignorados += 1
+                registro_existente = obtener_registro_por_firebase_key(firebase_key_unica)
+                potencia_firebase = obtener_medicion_electrica_firebase(valor).get(
+                    "potencia_activa_w"
+                )
+                if registro_existente:
+                    potencia_guardada = _a_numero(
+                        registro_existente.get("potencia_w"),
+                        defecto=None,
+                    )
+                    potencia_ya_actualizada = (
+                        potencia_firebase is None
+                        or (
+                            potencia_guardada is not None
+                            and abs(potencia_guardada - potencia_firebase) < 0.01
+                        )
+                    )
+                    if potencia_ya_actualizada:
+                        duplicados_ignorados += 1
+                        etapas.append({
+                            "paso": "skip_duplicado",
+                            "firebase_key": firebase_key_unica,
+                        })
+                        continue
                     etapas.append({
-                        "paso": "skip_duplicado",
+                        "paso": "corregir_potencia_duplicado",
                         "firebase_key": firebase_key_unica,
+                        "potencia_anterior_w": potencia_guardada,
+                        "potencia_firebase_w": potencia_firebase,
                     })
-                    continue
 
                 valor = aplicar_estado_comando_firebase(valor, pabellon, aire)
                 registro_anterior = obtener_ultimo_registro_supabase_rest(pabellon, aire)

@@ -150,6 +150,107 @@ def test_consumo_total_suma_intervalos_de_todos_los_aires():
     assert resumen["rooms_count"] == 2
 
 
+def test_historico_ml_reemplaza_potencia_agregada_cero_con_registros_reales(monkeypatch):
+    cliente = MagicMock()
+    for metodo in ("table", "select", "eq", "gte", "gt", "order"):
+        getattr(cliente, metodo).return_value = cliente
+    cliente.execute.side_effect = [
+        MagicMock(data=[{
+            "cubo_hora": "2026-07-17T14:00:00Z",
+            "temperatura_promedio": 25.0,
+            "humedad_promedio": 60.0,
+            "razon_presencia": 0.5,
+            "potencia_promedio_w": 0.0,
+            "energia_total_kwh": 0.0,
+            "dia_semana": 4,
+            "hora_del_dia": 14,
+            "cantidad_lecturas": 2,
+        }]),
+        MagicMock(data=[
+            {
+                "fecha_sync": "2026-07-17T14:10:00+00:00",
+                "temperatura_ambiente": 25.0,
+                "humedad": 60.0,
+                "potencia_w": 1000.0,
+                "estado_ocupacion": True,
+            },
+            {
+                "fecha_sync": "2026-07-17T14:20:00+00:00",
+                "temperatura_ambiente": 25.2,
+                "humedad": 61.0,
+                "potencia_w": 1200.0,
+                "estado_ocupacion": False,
+            },
+        ]),
+    ]
+    monkeypatch.setattr("app.ml.predictor.obtener_cliente", lambda: cliente)
+
+    resultado = ServicioPredictor().obtener_caracteristicas_entrenamiento(
+        "78c6626d-940e-4168-a94e-3da8ddc2add0", 7
+    )
+
+    assert resultado[0]["potencia_promedio_w"] == 1100.0
+    assert resultado[0]["fuente"] == "hourly_aggregates+registros"
+
+
+def test_historico_potencia_firebase_usa_solo_potencia_activa(monkeypatch):
+    ahora = datetime(2026, 7, 17, 15, tzinfo=timezone.utc)
+    fechas = {
+        "lectura_activa_w": datetime(2026, 7, 17, 14, 10, tzinfo=timezone.utc),
+        "lectura_activa_kw": datetime(2026, 7, 17, 14, 20, tzinfo=timezone.utc),
+        "lectura_legada": datetime(2026, 7, 17, 14, 30, tzinfo=timezone.utc),
+    }
+    monkeypatch.setattr(
+        "app.api.readings._fecha_desde_firebase_push_id",
+        lambda clave: fechas[clave],
+    )
+
+    resultado = _agrupar_potencia_activa_firebase({
+        "lectura_activa_w": {"potencia_activa_w": 1400, "potencia_w": 0},
+        "lectura_activa_kw": {"potencia_activa_kw": 1.6},
+        "lectura_legada": {"potencia_w": 900},
+    }, dias=1, ahora=ahora)
+
+    assert resultado == [{
+        "bucket_hour": "2026-07-17T14:00:00+00:00",
+        "avg_power_w": 1500.0,
+        "reading_count": 2,
+        "source": "firebase_potencia_activa_w",
+    }]
+
+
+def test_consumo_total_suma_intervalos_de_todos_los_aires():
+    filas = [
+        {
+            "pabellon": "robotica", "aire": "Aire_1",
+            "fecha_sync": "2026-07-01T00:01:00+00:00",
+            "consumo_intervalo_kwh": 0.10,
+            "tarifa_kwh": 0.18,
+            "costo_intervalo": 0.018,
+        },
+        {
+            "pabellon": "robotica", "aire": "Aire_1",
+            "fecha_sync": "2026-07-01T00:02:00+00:00",
+            "consumo_intervalo_kwh": 0.20,
+            "tarifa_kwh": 0.18,
+            "costo_intervalo": 0.036,
+        },
+        {
+            "pabellon": "robotica", "aire": "Aire_2",
+            "fecha_sync": "2026-07-01T00:01:00+00:00",
+            "consumo_intervalo_kwh": 0.30,
+            "tarifa_kwh": 0.20,
+            "costo_intervalo": 0.060,
+        },
+    ]
+
+    resumen = _resumir_consumo_total_aires(filas)
+
+    assert resumen["total_energy_kwh"] == 0.6
+    assert resumen["total_cost_usd"] == 0.114
+    assert resumen["rooms_count"] == 2
+
+
 def test_telemetria_electrica_firebase_tiene_prioridad_sobre_constante():
     valor = {
         "pabellon": "robotica",
@@ -170,6 +271,16 @@ def test_telemetria_electrica_firebase_tiene_prioridad_sobre_constante():
         "tarifa_kwh": 0.18,
         "costo_intervalo": 0.00216,
         "costo_acumulado_sesion": 0.0756,
+        "corriente_rms_cruda": 10.2,
+        "corriente_rms_instantanea": 9.9,
+        "corriente_calculada_vpp": 14.4,
+        "factor_calibracion_sct": 1.007,
+        "corriente_retenida_por_filtro": False,
+        "ceros_consecutivos_sct": 0,
+        "dht_ok": True,
+        "ds18b20_ok": True,
+        "fallos_dht": 0,
+        "fallos_ds18b20": 0,
     }
     anterior = {
         "energia_kwh": 2.5,
@@ -187,6 +298,110 @@ def test_telemetria_electrica_firebase_tiene_prioridad_sobre_constante():
     assert registro["consumo_acumulado_sesion_kwh"] == 0.42
     assert registro["factor_potencia"] == 0.8
     assert registro["costo_intervalo"] == 0.00216
+    assert registro["corriente_rms_cruda"] == 10.2
+    assert registro["corriente_calculada_vpp"] == 14.4
+    assert registro["dht_ok"] is True
+    assert registro["corriente_retenida_por_filtro"] is False
+
+
+async def test_csv_ml_incluye_telemetria_electrica_y_calidad(
+    cliente_prueba, mock_supabase, monkeypatch
+):
+    monkeypatch.setattr("app.api.compat.obtener_cliente", lambda: mock_supabase)
+    mock_supabase.execute.side_effect = [
+        MagicMock(data=[{"nombre": "Robótica", "pabellon": "robotica"}]),
+        MagicMock(data=[{
+            "fecha_sync": "2026-07-17T17:34:54+00:00",
+            "pabellon": "robotica",
+            "aire": "Aire_1",
+            "temperatura_ambiente": 30.4,
+            "temperatura_salida_aire": 22.5,
+            "humedad": 44.3,
+            "delta_t": 7.9,
+            "estado_ocupacion": False,
+            "potencia_activa_w": 907.97,
+            "consumo_intervalo_kwh": 0.015,
+            "dht_ok": True,
+            "ds18b20_ok": True,
+        }]),
+    ]
+
+    respuesta = await cliente_prueba.post(
+        "/api/v1/reports/energy", json={"format": "csv"}
+    )
+
+    assert respuesta.status_code == 200
+    encabezado, fila = respuesta.text.splitlines()[:2]
+    assert "delta_t_c" in encabezado
+    assert "potencia_activa_w" in encabezado
+    assert "consumo_intervalo_kwh" in encabezado
+    assert "dht_ok" in encabezado
+    assert "7.9" in fila
+    assert "907.97" in fila
+
+
+def test_potencia_activa_tiene_prioridad_sobre_cero_legado():
+    registro = preparar_registro_supabase(
+        "robotica",
+        "Aire_1",
+        "firebase-con-campo-legado",
+        {
+            "potencia_w": 0,
+            "potencia_activa_w": 1429.1,
+            "aire_encendido_atmos": False,
+            "temperatura_ambiente": 27.2,
+            "temperatura_salida_aire": 23.8,
+            "humedad": 52,
+        },
+    )
+
+    assert registro["potencia_w"] == 1429.1
+
+
+def test_historial_reemplaza_cero_por_potencia_de_la_misma_firebase_key():
+    registros = [{
+        "firebase_key": "robotica_Aire_1_-lectura123",
+        "fecha_sync": "2026-07-16T14:20:53Z",
+        "potencia_w": 0.0,
+    }]
+    lecturas_firebase = {
+        "-lectura123": {
+            "potencia_activa_w": 1416.60754,
+            "corriente_rms": 7.57544,
+            "voltaje_red_v": 220.0,
+        }
+    }
+
+    resultado = _completar_potencia_historica_desde_firebase(
+        registros,
+        lecturas_firebase,
+        "robotica",
+        "Aire_1",
+    )
+
+    assert resultado[0]["potencia_w"] == 1416.60754
+    assert resultado[0]["potencia_activa_w"] == 1416.60754
+    assert resultado[0]["corriente_rms"] == 7.57544
+    assert registros[0]["potencia_w"] == 0.0
+
+
+def test_historial_se_construye_directamente_desde_firebase():
+    resultado = _normalizar_historial_firebase(
+        {
+            "-OxfIX4rzpWXRaAyzLcf": {
+                "temperatura_ambiente": 27.3,
+                "potencia_activa_w": 1416.60754,
+                "corriente_rms": 7.57544,
+            }
+        },
+        "robotica",
+        "Aire_1",
+    )
+
+    assert resultado[0]["firebase_key"] == "robotica_Aire_1_-OxfIX4rzpWXRaAyzLcf"
+    assert resultado[0]["potencia_w"] == 1416.60754
+    assert resultado[0]["potencia_activa_w"] == 1416.60754
+    assert resultado[0]["fecha_sync"].startswith("2026-07-16T14:21:50")
 
 
 def test_constante_solo_se_usa_si_firebase_no_envia_medicion_electrica():
@@ -232,26 +447,40 @@ def test_dashboard_prefiere_consumo_intervalo_y_tarifa_de_firebase():
     assert resumen["metrics"]["period_cost_usd"] == 0.05
 
 
-def test_potencia_fisica_tiene_prioridad_sobre_estado_del_comando():
+def test_potencia_no_confirma_estado_hasta_calibrar_umbrales(monkeypatch):
+    monkeypatch.setattr(configuracion, "AC_POWER_THRESHOLDS_CALIBRATED", False)
     assert inferir_ac_encendido({
         "potencia_activa_w": 120.0,
         "aire_encendido_atmos": False,
-    }) is True
+    }) is None
     assert inferir_ac_encendido({
         "potencia_activa_w": 0.0,
         "aire_encendido_atmos": True,
-    }) is False
+    }) is None
 
 
-def test_histeresis_conserva_estado_anterior_en_zona_de_ruido():
+def test_zona_sin_calibrar_no_reutiliza_estado_software_como_prueba_fisica(monkeypatch):
+    monkeypatch.setattr(configuracion, "AC_POWER_THRESHOLDS_CALIBRATED", False)
     assert inferir_ac_encendido(
         {"potencia_activa_w": 35.0},
         {"aire_encendido_atmos": True},
-    ) is True
+    ) is None
     assert inferir_ac_encendido(
         {"potencia_activa_w": 35.0},
         {"aire_encendido_atmos": False},
-    ) is False
+    ) is None
+
+
+def test_umbrales_calibrados_determinan_estado_del_aire(monkeypatch):
+    monkeypatch.setattr(configuracion, "AC_POWER_THRESHOLDS_CALIBRATED", True)
+    monkeypatch.setattr(configuracion, "AC_POWER_OFF_THRESHOLD_W", 250.0)
+    monkeypatch.setattr(configuracion, "AC_POWER_ON_THRESHOLD_W", 500.0)
+
+    assert inferir_ac_encendido({"potencia_activa_w": 209.0}) is False
+    assert inferir_ac_encendido({"potencia_activa_w": 250.0}) is None
+    assert inferir_ac_encendido({"potencia_activa_w": 499.9}) is None
+    assert inferir_ac_encendido({"potencia_activa_w": 500.0}) is True
+    assert inferir_ac_encendido({"potencia_activa_w": 1413.0}) is True
 
 
 class FirebaseFalso:
@@ -273,7 +502,9 @@ class FirebaseFalso:
         self.estado.update(datos)
 
 
-def test_no_republica_mismo_comando_ir():
+def test_no_republica_mismo_comando_ir(monkeypatch):
+    monkeypatch.setattr(configuracion, "ATMOS_CONTROL_MODE", "active")
+    monkeypatch.setattr(configuracion, "ATMOS_IR_CONTROL_ENABLED", True)
     firebase = FirebaseFalso({
         "accion": "ahorro_24",
         "actualizado_en": "fecha-original",
@@ -290,7 +521,9 @@ def test_no_republica_mismo_comando_ir():
     assert firebase.estado["actualizado_en"] == "fecha-original"
 
 
-def test_publica_comando_ir_cuando_cambia_accion():
+def test_publica_comando_ir_cuando_cambia_accion(monkeypatch):
+    monkeypatch.setattr(configuracion, "ATMOS_CONTROL_MODE", "active")
+    monkeypatch.setattr(configuracion, "ATMOS_IR_CONTROL_ENABLED", True)
     firebase = FirebaseFalso({"accion": "ahorro_24", "resultado": "ejecutado"})
 
     resultado = ServicioPredictor().publicar_comando_si_cambio(
@@ -321,12 +554,12 @@ def test_mantener_sin_ir_no_reemplaza_modo_ahorro_actual():
     )
 
     assert resultado["publicado"] is False
-    assert resultado["motivo"] == "control_sin_envio_ir"
+    assert resultado["motivo"] == "decision_no_op"
     assert firebase.actualizaciones == []
     assert firebase.estado["accion"] == "ahorro_24"
 
 
-def test_reconcilia_mantener_invalido_con_ultima_firma_ejecutada():
+def test_mantener_no_reconcilia_ni_reescribe_un_comando_antiguo():
     firebase = FirebaseFalso({
         "accion": "mantener",
         "actualizado_en": "fecha-mantener",
@@ -343,12 +576,7 @@ def test_reconcilia_mantener_invalido_con_ultima_firma_ejecutada():
     )
 
     assert resultado["publicado"] is False
-    assert resultado["motivo"] == "estado_reconciliado_con_firma_ejecutada"
-    assert firebase.estado["accion"] == "ahorro_24"
-    assert firebase.estado["actualizado_en"] == "fecha-ahorro"
-    assert firebase.estado["resultado"] == "ejecutado"
-    firma_actual = (
-        f"accion:{firebase.estado['accion']}|actualizado_en:"
-        f"{firebase.estado['actualizado_en']}"
-    )
-    assert firma_actual == firebase.estado["firma_ejecutada"]
+    assert resultado["motivo"] == "decision_no_op"
+    assert firebase.actualizaciones == []
+    assert firebase.estado["accion"] == "mantener"
+    assert firebase.estado["resultado"] == "accion_no_reconocida"

@@ -21,6 +21,7 @@ class Configuracion(BaseSettings):
     FIREBASE_SYNC_AUTOSTART: bool = False
     # Firebase sync: minimo 60 s para evitar consultas repetidas.
     FIREBASE_SYNC_INTERVAL_SECONDS: int = Field(default=60, ge=60)
+    ATMOS_MAX_LECTURA_EDAD_SECONDS: int = Field(default=300, ge=30)
 
     # Control físico del AC: seguro por defecto. Solo ``active`` + ``true``
     # permite crear o publicar una orden ejecutable.

@@ -3,15 +3,31 @@ from fastapi import APIRouter, WebSocket
 from fastapi.websockets import WebSocketDisconnect
 
 from app.core.websocket_manager import gestor
-from app.core.security import verificar_api_key
+from app.core.security import obtener_usuario_actual, verificar_api_key
 from app.core.logger import log
 
 enrutador = APIRouter(prefix="/ws", tags=["websockets"])
 
 
 @enrutador.websocket("/salas/{sala_id}")
-async def ws_sala(websocket: WebSocket, sala_id: str, api_key: str | None = None):
-    if not verificar_api_key(api_key):
+async def ws_sala(
+    websocket: WebSocket,
+    sala_id: str,
+    api_key: str | None = None,
+    access_token: str | None = None,
+):
+    autorizado = verificar_api_key(api_key)
+    if not autorizado and access_token:
+        try:
+            await asyncio.to_thread(
+                obtener_usuario_actual,
+                f"Bearer {access_token}",
+            )
+            autorizado = True
+        except Exception:
+            autorizado = False
+
+    if not autorizado:
         await websocket.close(code=1008)
         return
 
@@ -28,8 +44,13 @@ async def ws_sala(websocket: WebSocket, sala_id: str, api_key: str | None = None
 
 
 @enrutador.websocket("/rooms/{sala_id}")
-async def ws_room_alias(websocket: WebSocket, sala_id: str, api_key: str | None = None):
-    await ws_sala(websocket, sala_id, api_key)
+async def ws_room_alias(
+    websocket: WebSocket,
+    sala_id: str,
+    api_key: str | None = None,
+    access_token: str | None = None,
+):
+    await ws_sala(websocket, sala_id, api_key, access_token)
 
 
 @enrutador.websocket("/alertas")

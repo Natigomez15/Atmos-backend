@@ -1,4 +1,4 @@
-AIRES_IGNORADOS: set[str] = set()
+﻿AIRES_IGNORADOS: set[str] = {"aire_2"}
 
 
 def normalizar_nombre_aire(valor: str | None) -> str:
@@ -7,3 +7,5 @@ def normalizar_nombre_aire(valor: str | None) -> str:
 
 def es_aire_ignorado(aire: str | None) -> bool:
     return normalizar_nombre_aire(aire) in AIRES_IGNORADOS
+
+

@@ -12,6 +12,7 @@ TABLA_SUSCRIPCIONES_PUSH = "push_subscriptions"
 
 # Roles destinatarios según tipo de alerta
 ROLES_POR_TIPO_ALERTA: dict[str, list[str]] = {
+    "ml_decision_pending": ["admin", "mantenimiento"],
     "node_offline":      ["admin", "mantenimiento"],
     "power_anomaly":     ["admin", "mantenimiento"],
     "temperature_stuck": ["admin", "mantenimiento"],
@@ -316,4 +317,106 @@ def notificar_alerta_push(
         "fuera_de_horario":   conteo_fuera_horario,
         "fallidas":           conteo_fallidas,
         "total_suscriptores": len(suscripciones),
+    }
+
+
+def notificar_decision_ml_pendiente(decision: dict) -> dict:
+    """Notifica una decisión ML nueva solo a usuarios autorizados para control."""
+    decision_id = str(decision.get("decision_id") or "").strip()
+    if not decision_id:
+        return {"enviadas": 0, "fallidas": 0, "motivo": "decision_id_ausente"}
+
+    expira_en = decision.get("expira_en")
+    if expira_en:
+        try:
+            expiracion = datetime.fromisoformat(str(expira_en).replace("Z", "+00:00"))
+            if expiracion.tzinfo is None:
+                expiracion = expiracion.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) >= expiracion.astimezone(timezone.utc):
+                return {"enviadas": 0, "fallidas": 0, "motivo": "decision_expirada"}
+        except (TypeError, ValueError):
+            logger.warning(f"Fecha de expiracion invalida en decision ML {decision_id}")
+
+    cliente = obtener_cliente()
+    try:
+        perfiles = (
+            cliente.table("profiles")
+            .select("id,rol,esta_activo")
+            .eq("esta_activo", True)
+            .execute()
+        )
+        ids_autorizados = {
+            str(perfil.get("id"))
+            for perfil in (perfiles.data or [])
+            if perfil.get("rol") in ("admin", "mantenimiento")
+        }
+        respuesta = (
+            cliente.table(TABLA_SUSCRIPCIONES_PUSH)
+            .select("*")
+            .eq("activa", True)
+            .execute()
+        )
+        suscripciones = [
+            suscripcion
+            for suscripcion in (respuesta.data or [])
+            if str(suscripcion.get("profile_id")) in ids_autorizados
+        ]
+    except Exception as error_query:
+        logger.error(f"Error al consultar destinatarios de decision ML: {error_query}")
+        return {
+            "enviadas": 0,
+            "fallidas": 0,
+            "motivo": "destinatarios_no_disponibles",
+            "detalle": str(error_query)[:300],
+        }
+
+    accion = str(decision.get("accion") or "revisar recomendacion")
+    etiquetas = {
+        "apagar": "apagar el aire",
+        "encender_22": "regular a 22 °C",
+        "encender_23": "regular a 23 °C",
+        "ahorro_24": "regular a 24 °C",
+        "enfriar_fuerte": "regular a 22 °C",
+    }
+    accion_legible = etiquetas.get(accion, accion.replace("_", " "))
+    confianza = decision.get("confianza_ml")
+    confianza_texto = ""
+    try:
+        if confianza is not None:
+            confianza_texto = f" · Confianza {round(float(confianza) * 100)} %"
+    except (TypeError, ValueError):
+        confianza_texto = ""
+
+    aire = str(decision.get("aire") or "Aire")
+    datos = {
+        "tipo_alerta": "ml_decision_pending",
+        "decision_id": decision_id,
+        "url": f"/alerts?decision_id={decision_id}",
+        "tag": f"ml-decision:{decision_id}",
+    }
+    enviadas = 0
+    fallidas = 0
+    resultados = []
+    for suscripcion in suscripciones:
+        resultado = enviar_notificacion_push_detallada(
+            suscripcion=suscripcion,
+            titulo="ATMOS necesita tu aprobación",
+            cuerpo=f"{aire} recomienda {accion_legible}{confianza_texto}",
+            datos=datos,
+        )
+        resultados.append(resultado)
+        if resultado.get("enviada"):
+            enviadas += 1
+        else:
+            fallidas += 1
+
+    logger.info(
+        f"Push decision ML {decision_id} — enviadas: {enviadas}, fallidas: {fallidas}"
+    )
+    return {
+        "enviadas": enviadas,
+        "fallidas": fallidas,
+        "total_suscriptores": len(suscripciones),
+        "motivo": "procesada",
+        "resultados": resultados,
     }

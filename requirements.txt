@@ -11,6 +11,7 @@ joblib
 pandas
 scikit-learn==1.6.1
 pyrebase4
+firebase-admin
 websockets
 pytest==8.2.0
 pytest-asyncio==0.23.6

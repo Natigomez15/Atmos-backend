@@ -23,7 +23,12 @@ from app.core.logger import log
 from app.ml.atmos_logic import dentro_de_horario_operacion, ejecutar_atmos
 from app.ml.impacto import evaluar_estado_electrico
 from app.ml.metadata_modelo import construir_panel_modelo
-from app.services.sincronizador_firebase import leer_ultima_lectura_valida_firebase_rest
+from app.services.sincronizador_firebase import (
+    fecha_lectura_firebase,
+    leer_ultima_lectura_valida_firebase_rest,
+)
+from app.services.notificaciones_service import notificar_decision_ml_pendiente
+from app.config import configuracion
 
 
 MODELO_ATMOS_PATH = Path(__file__).with_name("modelo_atmos (1).pkl")
@@ -451,12 +456,44 @@ class ServicioPredictor:
             decision_id,
         ).update(datos)
 
+        # La decisión ya está persistida y todavía no existe ningún comando
+        # físico. Este marcador hace idempotente el envío frente al scheduler.
+        inicio_push = self._fecha_iso_utc()
+        referencia.update({
+            "push_status": "procesando",
+            "push_attempted_at": inicio_push,
+        })
+        resultado_push = notificar_decision_ml_pendiente(datos)
+        fin_push = self._fecha_iso_utc()
+        estado_push = (
+            "enviada"
+            if resultado_push.get("enviadas", 0) > 0
+            else "sin_destinatarios"
+            if resultado_push.get("total_suscriptores", 0) == 0
+            else "fallida"
+        )
+        trazabilidad_push = {
+            "push_status": estado_push,
+            "push_attempted_at": inicio_push,
+            "push_sent_at": fin_push if estado_push == "enviada" else None,
+            "push_enviadas": resultado_push.get("enviadas", 0),
+            "push_fallidas": resultado_push.get("fallidas", 0),
+        }
+        referencia.update(trazabilidad_push)
+        self._referencia_historial_alerta_ml(
+            firebase_db,
+            area,
+            aire,
+            decision_id,
+        ).update(trazabilidad_push)
+
         return {
             "creada": True,
             "hay_pendiente": True,
             "motivo": "pendiente_aprobacion_humana",
             "decision_id": decision_id,
             "accion": accion_normalizada,
+            "push": resultado_push,
         }
 
     def rechazar_decision_ml_pendiente(
@@ -648,6 +685,9 @@ class ServicioPredictor:
         if datos.get("temp_ac") is None and datos.get("temperatura_salida_aire") is not None:
             datos["temp_ac"] = datos["temperatura_salida_aire"]
         datos.pop("temperatura_salida_aire", None)
+        # delta_t se publica para trazabilidad, pero ejecutar_atmos lo calcula
+        # internamente y no lo acepta como argumento.
+        datos.pop("delta_t", None)
 
         estado_control = self.obtener_estado_control_registro(
             sala_id=sala_id,
@@ -690,8 +730,6 @@ class ServicioPredictor:
         self, area: str = "robotica", aire: str = "Aire_1"
     ) -> dict:
         horario = self.obtener_estado_horario_operacion()
-        if not horario["dentro_horario"]:
-            return self.respuesta_fuera_horario(horario)
 
         firebase_db = obtener_firebase()
         seleccion = self.obtener_ultima_lectura_firebase(firebase_db, area, aire)
@@ -729,15 +767,80 @@ class ServicioPredictor:
             }
 
         lectura = seleccion["lectura"]
+        lectura_timestamp_dt = fecha_lectura_firebase(
+            seleccion.get("firebase_key") or "",
+            lectura,
+        )
+        prediccion_timestamp = datetime.now(ZONA_HORARIA_ATMOS)
+        edad_lectura_segundos = (
+            max(
+                0,
+                round(
+                    (
+                        prediccion_timestamp.astimezone(timezone.utc)
+                        - lectura_timestamp_dt.astimezone(timezone.utc)
+                    ).total_seconds()
+                ),
+            )
+            if lectura_timestamp_dt is not None
+            else None
+        )
         datos_atmos = self.preparar_lectura_firebase(lectura)
         datos_atmos["pabellon"] = area
         datos_atmos["aire"] = aire
+        lectura_desactualizada = (
+            edad_lectura_segundos is None
+            or edad_lectura_segundos > configuracion.ATMOS_MAX_LECTURA_EDAD_SECONDS
+        )
+        if lectura_desactualizada:
+            return {
+                "lectura_firebase": lectura,
+                "lectura_valida": True,
+                "lectura_desactualizada": True,
+                "lectura_timestamp": (
+                    lectura_timestamp_dt.astimezone(ZONA_HORARIA_ATMOS).isoformat()
+                    if lectura_timestamp_dt else None
+                ),
+                "edad_lectura_segundos": edad_lectura_segundos,
+                "max_edad_lectura_segundos": configuracion.ATMOS_MAX_LECTURA_EDAD_SECONDS,
+                "firebase_key_usado": seleccion.get("firebase_key"),
+                "entrada_modelo": self.publicar_entrada_modelo(datos_atmos),
+                "resultado_modelo": None,
+                "modelo_ml": self.trazabilidad_modelo_no_usado(
+                    "la ultima lectura disponible esta desactualizada"
+                ),
+                "accion": None,
+                "recomendacion": None,
+                "prediccion_timestamp": prediccion_timestamp.isoformat(),
+                "advertencias": [
+                    *seleccion.get("advertencias", []),
+                    "Lectura desactualizada: no se genero una recomendacion actual.",
+                ],
+                "mensaje": "La ultima lectura es demasiado antigua para ejecutar el ML.",
+            }
+        if not horario["dentro_horario"]:
+            return {
+                **self.respuesta_fuera_horario(horario),
+                "lectura_firebase": lectura,
+                "lectura_valida": True,
+                "lectura_desactualizada": False,
+                "lectura_timestamp": lectura_timestamp_dt.astimezone(
+                    ZONA_HORARIA_ATMOS
+                ).isoformat(),
+                "edad_lectura_segundos": edad_lectura_segundos,
+                "entrada_modelo": self.publicar_entrada_modelo(datos_atmos),
+                "resultado_modelo": None,
+                "accion": "apagar",
+                "recomendacion": "apagar",
+                "prediccion_timestamp": prediccion_timestamp.isoformat(),
+                "mensaje": "Fuera de horario operativo; recomendacion segura: apagar.",
+            }
         if datos_atmos.get("presencia") == 0:
             datos_atmos["minutos_sin_presencia"] = self.calcular_minutos_sin_presencia(
                 pabellon=area,
                 aire=aire,
             ) or 0
-        resultado = self.decidir_atmos(datos_atmos)
+        resultado = self.decidir_atmos(dict(datos_atmos))
         accion = (
             self.traducir_accion_esp32(resultado)
             if resultado.get("valido") and resultado.get("procesado", True)
@@ -778,32 +881,39 @@ class ServicioPredictor:
         }
 
         if requiere_aprobacion_humana:
-            alerta_ml = self.registrar_alerta_ml_pendiente(
-                firebase_db,
-                area,
-                aire,
-                accion,
-                metadata=metadata_alerta_ml,
-                lectura={
-                    "temperatura_ambiente": (
-                        lectura.get("temp_ambiente")
-                        or lectura.get("temperatura_ambiente")
-                        or lectura.get("temperatura")
-                    ),
-                    "temperatura_salida_aire": (
-                        lectura.get("temp_ac")
-                        or lectura.get("temperatura_salida_aire")
-                        or lectura.get("temperatura_salida")
-                    ),
-                    "humedad": lectura.get("humedad"),
-                    "presencia": datos_atmos.get("presencia"),
-                    "potencia_w": (
-                        lectura.get("potencia_w")
-                        or lectura.get("potencia_activa_w")
-                    ),
-                },
-                firebase_key=seleccion.get("firebase_key"),
-            )
+            try:
+                alerta_ml = self.registrar_alerta_ml_pendiente(
+                    firebase_db,
+                    area,
+                    aire,
+                    accion,
+                    metadata=metadata_alerta_ml,
+                    lectura={
+                        "temperatura_ambiente": (
+                            lectura.get("temp_ambiente")
+                            or lectura.get("temperatura_ambiente")
+                            or lectura.get("temperatura")
+                        ),
+                        "temperatura_salida_aire": (
+                            lectura.get("temp_ac")
+                            or lectura.get("temperatura_salida_aire")
+                            or lectura.get("temperatura_salida")
+                        ),
+                        "humedad": lectura.get("humedad"),
+                        "presencia": datos_atmos.get("presencia"),
+                        "potencia_w": (
+                            lectura.get("potencia_w")
+                            or lectura.get("potencia_activa_w")
+                        ),
+                    },
+                    firebase_key=seleccion.get("firebase_key"),
+                )
+            except Exception as error:
+                alerta_ml = {
+                    "creada": False,
+                    "motivo": "firebase_admin_no_disponible",
+                    "error": str(error),
+                }
             publicacion_comando = {
                 "publicado": False,
                 "motivo": "pendiente_aprobacion_humana",
@@ -811,16 +921,19 @@ class ServicioPredictor:
                 "decision_id": alerta_ml.get("decision_id"),
             }
         else:
-            self.cerrar_alerta_ml_pendiente(
-                firebase_db,
-                area,
-                aire,
-                (
-                    "el_modelo_ya_no_requiere_accion_fisica"
-                    if accion_es_no_op(accion)
-                    else "la_capa_de_seguridad_no_autoriza_ejecutar_la_accion"
-                ),
-            )
+            try:
+                self.cerrar_alerta_ml_pendiente(
+                    firebase_db,
+                    area,
+                    aire,
+                    (
+                        "el_modelo_ya_no_requiere_accion_fisica"
+                        if accion_es_no_op(accion)
+                        else "la_capa_de_seguridad_no_autoriza_ejecutar_la_accion"
+                    ),
+                )
+            except Exception:
+                pass
             alerta_ml = {
                 "creada": False,
                 "hay_pendiente": False,
@@ -846,26 +959,47 @@ class ServicioPredictor:
                 resultado["control"].get("ejecutar_ir") and accion != "mantener"
                 and publicacion_comando["publicado"]
             )
-        actualizacion_supabase = self.guardar_decision_en_registro(
-            pabellon=area,
-            aire=aire,
-            accion=accion,
-            resultado=resultado,
-            horario=horario,
-            comando_publicado=publicacion_comando.get("publicado") is True,
-        )
-        prediccion_guardada = self.guardar_prediccion_modelo_valida(
-            pabellon=area,
-            aire=aire,
-            accion=accion,
-            resultado=resultado,
-            modelo_ml=modelo_ml,
-            actualizacion_supabase=actualizacion_supabase,
-        )
+        try:
+            actualizacion_supabase = self.guardar_decision_en_registro(
+                pabellon=area,
+                aire=aire,
+                accion=accion,
+                resultado=resultado,
+                horario=horario,
+                comando_publicado=publicacion_comando.get("publicado") is True,
+            )
+        except Exception as error:
+            actualizacion_supabase = {
+                "actualizado": False,
+                "motivo": "supabase_no_disponible",
+                "error": str(error),
+            }
+        try:
+            prediccion_guardada = self.guardar_prediccion_modelo_valida(
+                pabellon=area,
+                aire=aire,
+                accion=accion,
+                resultado=resultado,
+                modelo_ml=modelo_ml,
+                actualizacion_supabase=actualizacion_supabase,
+            )
+        except Exception as error:
+            prediccion_guardada = {
+                "guardada": False,
+                "motivo": "supabase_no_disponible",
+                "error": str(error),
+            }
 
         return {
             "lectura_firebase": lectura,
             "lectura_valida": True,
+            "lectura_desactualizada": False,
+            "lectura_timestamp": (
+                lectura_timestamp_dt.astimezone(ZONA_HORARIA_ATMOS).isoformat()
+                if lectura_timestamp_dt else None
+            ),
+            "edad_lectura_segundos": edad_lectura_segundos,
+            "max_edad_lectura_segundos": configuracion.ATMOS_MAX_LECTURA_EDAD_SECONDS,
             "firebase_key_usado": (
                 f"{area}_{aire}_{seleccion['firebase_key']}"
                 if seleccion.get("firebase_key")
@@ -878,6 +1012,8 @@ class ServicioPredictor:
             "resultado_modelo": self.publicar_resultado_modelo(resultado),
             "modelo_ml": modelo_ml,
             "accion": accion,
+            "recomendacion": accion,
+            "prediccion_timestamp": prediccion_timestamp.isoformat(),
             "publicacion_comando": publicacion_comando,
             "requiere_aprobacion_humana": requiere_aprobacion_humana,
             "alerta_ml": alerta_ml,
@@ -897,17 +1033,24 @@ class ServicioPredictor:
         pabellon: str | None = None,
         aire: str | None = None,
     ) -> dict:
-        cliente = obtener_cliente()
         columnas = (
             "id,fecha_sync,recomendacion_local,ultima_accion_ejecutada,"
             "ultima_accion_ir,ciclo_enfriamiento_temp_inicio,ciclo_enfriamiento_inicio"
         )
-        consulta = (
-            cliente.table("registros")
-            .select(columnas)
-            .order("fecha_sync", desc=True)
-            .limit(1)
-        )
+        try:
+            cliente = obtener_cliente()
+            consulta = (
+                cliente.table("registros")
+                .select(columnas)
+                .order("fecha_sync", desc=True)
+                .limit(1)
+            )
+        except Exception as error:
+            log.warning({
+                "evento": "estado_control_atmos_no_disponible",
+                "error": str(error),
+            })
+            return {}
         if sala_id:
             consulta = consulta.eq("sala_id", str(sala_id))
         if nodo_id:
@@ -1273,6 +1416,7 @@ class ServicioPredictor:
             "temp_ambiente": temp_ambiente,
             "temp_ac": temp_ac,
             "temperatura_salida_aire": temp_ac,
+            "delta_t": round(temp_ambiente - temp_ac, 3),
             "humedad": float(buscar("humedad")),
             "minutos_sin_presencia": int(buscar(
                 "minutos_sin_presencia",
@@ -1330,7 +1474,10 @@ class ServicioPredictor:
         pabellon: str | None = None,
         aire: str | None = None,
     ) -> int | None:
-        cliente = obtener_cliente()
+        try:
+            cliente = obtener_cliente()
+        except Exception:
+            return None
 
         # La fuente principal actual del prototipo es registros, sincronizada
         # desde Firebase. sensor_readings se mantiene como fallback legado.

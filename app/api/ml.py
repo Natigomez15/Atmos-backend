@@ -417,6 +417,28 @@ async def decidir_atmos_desde_firebase(
         raise HTTPException(status_code=422, detail=str(error))
 
 
+@limitador.limit("30/minute")
+@enrutador.post("/recommendations/current")
+async def obtener_recomendacion_actual(
+    request: Request,
+    pabellon: str = "robotica",
+    aire: str = "Aire_1",
+):
+    """Evalúa la última lectura real; nunca presenta una lectura vieja como actual."""
+    try:
+        return ServicioPredictor().decidir_atmos_desde_firebase(
+            area=pabellon.strip(),
+            aire=aire.strip(),
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"No se pudo evaluar la lectura actual de Firebase: {error}",
+        ) from error
+
+
 
 @enrutador.get("/decisiones/pendiente")
 async def obtener_decision_ml_pendiente(

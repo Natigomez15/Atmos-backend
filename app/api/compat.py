@@ -784,12 +784,26 @@ async def dashboard_energia(range: Annotated[str, Query(alias="range")] = "24h")
     clave_rango, config_rango = rango_dashboard(range)
     fin_local = ahora_panama()
     inicio_hoy_local = fin_local.replace(hour=0, minute=0, second=0, microsecond=0)
-    dias_consulta = max(config_rango.dias, 30)
+    # El rango inicial de 24 h solo necesita hoy y la ventana comparable de
+    # siete días. Descargar siempre 30 días hacía 44 llamadas paginadas y
+    # superaba el timeout del frontend aun cuando Supabase estaba saludable.
+    dias_consulta = max(config_rango.dias, 8)
     inicio_rango_local = fin_local - timedelta(days=dias_consulta)
     inicio_semana_local = inicio_hoy_local - timedelta(days=7)
     desde_iso = min(inicio_rango_local, inicio_semana_local).astimezone(timezone.utc).isoformat()
 
     cliente = obtener_cliente()
+    columnas_dashboard = ",".join((
+        "aire",
+        "fecha_sync",
+        "potencia_w",
+        "energia_kwh",
+        "consumo_intervalo_kwh",
+        "tarifa_kwh",
+        "costo_intervalo",
+        "estado_ocupacion",
+        "aire_encendido_atmos",
+    ))
     tamano_pagina = 1000
     pagina = 0
     filas_crudas: list[dict] = []
@@ -798,7 +812,7 @@ async def dashboard_energia(range: Annotated[str, Query(alias="range")] = "24h")
         respuesta = (
             cliente
             .table("registros")
-            .select("*")
+            .select(columnas_dashboard)
             .gte("fecha_sync", desde_iso)
             .order("fecha_sync", desc=False)
             .range(inicio_pagina, inicio_pagina + tamano_pagina - 1)

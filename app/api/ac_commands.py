@@ -40,6 +40,20 @@ from app.core.limiter import limitador
 enrutador = APIRouter(prefix="/comandos-ac", tags=["comandos-ac"])
 
 
+def expirar_comandos_vencidos(cliente, ahora: datetime | None = None) -> int:
+    """Cierra órdenes cuyo TTL terminó sin confirmación del ESP32."""
+    instante = ahora or datetime.now(timezone.utc)
+    respuesta = (
+        cliente.table("ac_commands")
+        .update({"estado": "expirado"})
+        .eq("estado", "pendiente")
+        .eq("fue_ejecutado", False)
+        .lt("expires_at", instante.isoformat())
+        .execute()
+    )
+    return len(respuesta.data or [])
+
+
 def _bloquear_si_control_inactivo(*, automatico: bool = False) -> None:
     habilitado = control_ir_habilitado() if automatico else control_manual_ir_habilitado()
     if not habilitado:
@@ -243,6 +257,7 @@ async def listar_comandos(
     solo_pendientes: bool = False,
 ):
     cliente = obtener_cliente()
+    expirar_comandos_vencidos(cliente)
     consulta = (
         cliente.table("ac_commands")
         .select("*")
@@ -251,7 +266,7 @@ async def listar_comandos(
         .limit(limite)
     )
     if solo_pendientes:
-        consulta = consulta.eq("fue_ejecutado", False)
+        consulta = consulta.eq("fue_ejecutado", False).eq("estado", "pendiente")
 
     respuesta = consulta.execute()
     return respuesta.data

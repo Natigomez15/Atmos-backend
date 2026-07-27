@@ -24,6 +24,15 @@ from app.ml.impacto import (
 
 ZONA_HORARIA_PANAMA = timezone(timedelta(hours=-5), "America/Panama")
 MAX_LECTURAS_FIREBASE_POR_CONSULTA = 100
+FIREBASE_PUSH_CHARS = "-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
+CLAVES_TIMESTAMP_FIREBASE = (
+    "timestamp",
+    "fecha",
+    "fecha_lectura",
+    "recorded_at",
+    "registrado_en",
+    "created_at",
+)
 
 CAMPOS_ELECTRICOS_FIREBASE = {
     "corriente_rms",
@@ -119,6 +128,59 @@ def obtener_valor_lectura(valor: dict, *claves: str) -> Any:
         if clave in valor:
             return valor.get(clave)
     return None
+
+
+def fecha_desde_firebase_push_id(firebase_key: str) -> datetime | None:
+    """Extrae en UTC el instante codificado por un Firebase push ID."""
+    if not isinstance(firebase_key, str) or len(firebase_key) < 8:
+        return None
+    milisegundos = 0
+    try:
+        for caracter in firebase_key[:8]:
+            milisegundos = milisegundos * 64 + FIREBASE_PUSH_CHARS.index(caracter)
+        return datetime.fromtimestamp(milisegundos / 1000, tz=timezone.utc)
+    except (ValueError, OSError, OverflowError):
+        return None
+
+
+def _fecha_desde_valor(valor: Any) -> datetime | None:
+    if valor in (None, "") or isinstance(valor, bool):
+        return None
+    try:
+        if isinstance(valor, (int, float)):
+            numero = float(valor)
+            if numero > 10_000_000_000:
+                numero /= 1000
+            return datetime.fromtimestamp(numero, tz=timezone.utc)
+        texto = str(valor).strip()
+        if texto.replace(".", "", 1).isdigit():
+            return _fecha_desde_valor(float(texto))
+        fecha = datetime.fromisoformat(texto.replace("Z", "+00:00"))
+        if fecha.tzinfo is None:
+            fecha = fecha.replace(tzinfo=ZONA_HORARIA_PANAMA)
+        return fecha.astimezone(timezone.utc)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def fecha_lectura_firebase(firebase_key: str, valor: dict | None) -> datetime | None:
+    """Resuelve el timestamp real, priorizando el declarado por el sensor."""
+    if isinstance(valor, dict):
+        for clave in CLAVES_TIMESTAMP_FIREBASE:
+            fecha = _fecha_desde_valor(valor.get(clave))
+            if fecha is not None:
+                return fecha
+    return fecha_desde_firebase_push_id(firebase_key)
+
+
+def _prefijo_push_id(fecha: datetime) -> str:
+    fecha_utc = fecha.astimezone(timezone.utc)
+    milisegundos = int(fecha_utc.timestamp() * 1000)
+    caracteres = ["-"] * 8
+    for indice in range(7, -1, -1):
+        caracteres[indice] = FIREBASE_PUSH_CHARS[milisegundos % 64]
+        milisegundos //= 64
+    return "".join(caracteres)
 
 
 def validar_lectura_firebase(valor: dict) -> tuple[bool, list[str]]:
@@ -247,7 +309,16 @@ def seleccionar_ultima_lectura_valida(lecturas: dict) -> dict:
     lecturas_invalidas = 0
     advertencias: list[str] = []
 
-    for firebase_key, valor in reversed(sorted(lecturas.items())):
+    ordenadas = sorted(
+        lecturas.items(),
+        key=lambda item: (
+            fecha_lectura_firebase(item[0], item[1] if isinstance(item[1], dict) else None)
+            or datetime.min.replace(tzinfo=timezone.utc),
+            item[0],
+        ),
+        reverse=True,
+    )
+    for firebase_key, valor in ordenadas:
         if not isinstance(valor, dict):
             lecturas_invalidas += 1
             advertencias.append(f"{firebase_key}: formato invalido")
@@ -353,7 +424,10 @@ def preparar_registro_supabase(
     nodo_id: str | None = None,
     registro_anterior: dict | None = None,
 ) -> dict:
-    fecha_sync = datetime.now(ZONA_HORARIA_PANAMA)
+    fecha_sync = (
+        fecha_lectura_firebase(firebase_key, valor)
+        or datetime.now(ZONA_HORARIA_PANAMA)
+    )
     temperatura_ambiente = _a_numero(
         valor.get(
             "temperatura_ambiente",
@@ -485,6 +559,42 @@ def leer_ultimas_lecturas_firebase_rest(
 
     datos = respuesta.json()
     return datos if isinstance(datos, dict) else {}
+
+
+def leer_lecturas_firebase_rango_rest(
+    pabellon: str,
+    aire: str,
+    desde: datetime,
+    hasta: datetime,
+) -> dict:
+    """Lee el rango solicitado en Firebase, sin recortarlo a las últimas N."""
+    desde_utc = desde.astimezone(timezone.utc)
+    hasta_utc = hasta.astimezone(timezone.utc)
+    if hasta_utc < desde_utc:
+        raise ValueError("El final del rango no puede ser anterior al inicio")
+
+    database_url = configuracion.FIREBASE_DATABASE_URL.rstrip("/")
+    ruta = (
+        f"Atmos/registro/{quote(str(pabellon).strip(), safe='')}/"
+        f"{quote(str(aire).strip(), safe='')}/lecturas.json"
+    )
+    parametros = urlencode({
+        "orderBy": '"$key"',
+        "startAt": f'"{_prefijo_push_id(desde_utc)}"',
+        "endAt": f'"{_prefijo_push_id(hasta_utc)}\uf8ff"',
+    })
+    respuesta = httpx.get(f"{database_url}/{ruta}?{parametros}", timeout=20)
+    respuesta.raise_for_status()
+    datos = respuesta.json()
+    if not isinstance(datos, dict):
+        return {}
+    return {
+        key: valor
+        for key, valor in datos.items()
+        if isinstance(valor, dict)
+        and (fecha := fecha_lectura_firebase(key, valor)) is not None
+        and desde_utc <= fecha <= hasta_utc
+    }
 
 
 def leer_ultima_lectura_valida_firebase_rest(

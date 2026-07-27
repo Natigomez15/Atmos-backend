@@ -13,10 +13,14 @@ from app.core.logger import log
 from app.core.security import obtener_usuario_opcional, requerir_mantenimiento_o_admin
 from app.ml.impacto import TARIFA_KWH
 from app.models.schemas import SalaActualizar, SalaCrear
-from app.api.ac_commands import comando_desde_prediccion
+from app.api.ac_commands import comando_desde_prediccion, expirar_comandos_vencidos
 from app.services.alert_service import ServicioAlertas
 from app.services.dashboard_energy import construir_resumen_dashboard, rango_dashboard, ahora_panama
-from app.services.sincronizador_firebase import leer_ultima_lectura_valida_firebase_rest
+from app.services.sincronizador_firebase import (
+    leer_lecturas_firebase_rango_rest,
+    leer_ultima_lectura_valida_firebase_rest,
+    preparar_registro_supabase,
+)
 from app.core.aires import es_aire_ignorado
 from app.core.control_ir import (
     accion_es_no_op,
@@ -589,6 +593,7 @@ async def listar_readings(
     limit: Annotated[int, Query(ge=1, le=2000)] = 500,
 ):
     cliente = obtener_cliente()
+    expirar_comandos_vencidos(cliente)
     consulta = (
         cliente.table("registros")
         .select("*")
@@ -784,26 +789,43 @@ async def dashboard_energia(range: Annotated[str, Query(alias="range")] = "24h")
     inicio_semana_local = inicio_hoy_local - timedelta(days=7)
     desde_iso = min(inicio_rango_local, inicio_semana_local).astimezone(timezone.utc).isoformat()
 
-    respuesta = (
-        obtener_cliente()
-        .table("registros")
-        .select("*")
-        .gte("fecha_sync", desde_iso)
-        # El volumen puede superar 10,000 filas en 30 dias. Se solicitan las
-        # mas recientes para que el limite no deje fuera las lecturas de hoy;
-        # el servicio de dashboard las ordena cronologicamente despues.
-        .order("fecha_sync", desc=True)
-        .limit(10000)
-        .execute()
-    )
+    cliente = obtener_cliente()
+    tamano_pagina = 1000
+    pagina = 0
+    filas_crudas: list[dict] = []
+    while True:
+        inicio_pagina = pagina * tamano_pagina
+        respuesta = (
+            cliente
+            .table("registros")
+            .select("*")
+            .gte("fecha_sync", desde_iso)
+            .order("fecha_sync", desc=False)
+            .range(inicio_pagina, inicio_pagina + tamano_pagina - 1)
+            .execute()
+        )
+        lote = respuesta.data or []
+        filas_crudas.extend(lote)
+        pagina += 1
+        if len(lote) < tamano_pagina:
+            break
+
     filas = [
         fila
-        for fila in (respuesta.data or [])
+        for fila in filas_crudas
         if not es_aire_ignorado(fila.get("aire"))
     ]
     resumen = construir_resumen_dashboard(filas, clave_rango)
-    resumen["phase2"]["activity"] = _obtener_actividad_sistema_dashboard()
-    resumen["source"] = "registros"
+    resumen["source"] = "supabase.registros"
+    resumen["data_query"] = {
+        "source": "supabase.registros",
+        "from": desde_iso,
+        "rows_received": len(filas_crudas),
+        "rows_used": len(filas),
+        "pages": pagina,
+        "page_size": tamano_pagina,
+        "truncated": False,
+    }
     return resumen
 
 
@@ -879,7 +901,7 @@ async def listar_ac_commands(
     if id_sala:
         consulta = consulta.eq("sala_id", str(id_sala))
     if only_pending is True or solo_pendientes is True:
-        consulta = consulta.eq("fue_ejecutado", False)
+        consulta = consulta.eq("fue_ejecutado", False).eq("estado", "pendiente")
 
     respuesta = consulta.execute()
     return [_mapear_comando(comando) for comando in respuesta.data or []]
@@ -972,22 +994,80 @@ async def ac_command_from_prediction(prediccion_id: int):
 async def reporte_energia(carga: dict | None = None):
     cliente = obtener_cliente()
 
-    # Obtener nombres de salones por pabellon
-    salas_resp = cliente.table("rooms").select("nombre,pabellon").execute()
+    salas_resp = cliente.table("rooms").select(
+        "id,nombre,pabellon,edificio,aires"
+    ).execute()
+    ids_solicitados = {
+        str(valor) for valor in ((carga or {}).get("room_ids") or []) if valor
+    }
+    salas = [
+        sala for sala in (salas_resp.data or [])
+        if not ids_solicitados or str(sala.get("id")) in ids_solicitados
+    ]
     pabellon_a_nombre = {
-        r["pabellon"]: r["nombre"]
-        for r in (salas_resp.data or [])
-        if r.get("pabellon") and r.get("nombre")
+        (r.get("pabellon") or r.get("edificio")): r["nombre"]
+        for r in salas
+        if (r.get("pabellon") or r.get("edificio")) and r.get("nombre")
     }
 
-    query = cliente.table("registros").select("*")
     period = (carga or {}).get("period", {})
-    if period.get("start"):
-        query = query.gte("fecha_sync", period["start"])
-    if period.get("end"):
-        query = query.lte("fecha_sync", period["end"])
-    respuesta = query.order("fecha_sync", desc=True).limit(5000).execute()
-    registros = respuesta.data or []
+    if not period.get("start") and not period.get("end"):
+        # Compatibilidad con consumidores anteriores que pedían el CSV sin rango.
+        respuesta = (
+            cliente.table("registros")
+            .select("*")
+            .order("fecha_sync", desc=True)
+            .limit(5000)
+            .execute()
+        )
+        registros = respuesta.data or []
+    else:
+        registros = None
+    try:
+        inicio = (
+            datetime.fromisoformat(str(period["start"]).replace("Z", "+00:00"))
+            if registros is None else None
+        )
+        fin = (
+            datetime.fromisoformat(str(period["end"]).replace("Z", "+00:00"))
+            if registros is None else None
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise HTTPException(
+            status_code=422,
+            detail="El reporte requiere period.start y period.end con zona horaria.",
+        ) from error
+    if registros is None and (inicio.tzinfo is None or fin.tzinfo is None):
+        raise HTTPException(
+            status_code=422,
+            detail="Las fechas del reporte deben incluir zona horaria.",
+        )
+    if registros is None and fin < inicio:
+        raise HTTPException(status_code=422, detail="Rango de fechas invalido.")
+
+    if registros is None:
+        registros = []
+        for sala in salas:
+            pabellon = sala.get("pabellon") or sala.get("edificio")
+            aires = sala.get("aires") or []
+            if not aires and sala.get("nombre", "").lower().startswith("aire_"):
+                aires = [sala["nombre"]]
+            for aire in aires:
+                lecturas = leer_lecturas_firebase_rango_rest(
+                    pabellon=pabellon,
+                    aire=aire,
+                    desde=inicio,
+                    hasta=fin,
+                )
+                for firebase_key, valor in lecturas.items():
+                    registros.append(preparar_registro_supabase(
+                        pabellon=pabellon,
+                        aire=aire,
+                        firebase_key=firebase_key,
+                        valor=valor,
+                        sala_id=str(sala.get("id")) if sala.get("id") else None,
+                    ))
+        registros.sort(key=lambda registro: registro.get("fecha_sync") or "", reverse=True)
     por_salon: dict[tuple[str, str], list[dict]] = {}
     for registro in registros:
         clave = (registro.get("pabellon") or "", registro.get("aire") or "")

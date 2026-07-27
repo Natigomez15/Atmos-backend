@@ -9,6 +9,8 @@ from app.config import configuracion
 
 ZONA_PANAMA = ZoneInfo("America/Panama")
 MAX_INTERVALO_INTEGRACION_MIN = 10
+COBERTURA_MINIMA_DIA = 0.80
+COBERTURA_MINIMA_HORA = 0.75
 
 
 @dataclass(frozen=True)
@@ -21,8 +23,8 @@ class ConfiguracionRango:
 
 RANGOS: dict[str, ConfiguracionRango] = {
     "24h": ConfiguracionRango(dias=1, modo="power", bucket_horas=1, etiqueta="24 h"),
-    "7d": ConfiguracionRango(dias=7, modo="power", bucket_horas=6, etiqueta="7 dias"),
-    "15d": ConfiguracionRango(dias=15, modo="power", bucket_horas=6, etiqueta="15 dias"),
+    "7d": ConfiguracionRango(dias=7, modo="energy", bucket_horas=24, etiqueta="7 dias"),
+    "15d": ConfiguracionRango(dias=15, modo="energy", bucket_horas=24, etiqueta="15 dias"),
     "30d": ConfiguracionRango(dias=30, modo="energy", bucket_horas=24, etiqueta="30 dias"),
     "3m": ConfiguracionRango(dias=90, modo="energy", bucket_horas=24, etiqueta="3 meses"),
 }
@@ -154,18 +156,21 @@ def iterar_intervalos(registros: list[dict]):
         horas = segundos / 3600
         consumo_medido = actual["_consumo_intervalo_kwh"]
         if consumo_medido is not None:
-            yield anterior, inicio, horas, max(0.0, consumo_medido)
+            yield anterior, inicio, horas, max(0.0, consumo_medido), "consumo_intervalo_kwh"
             continue
+        energia_anterior = anterior["_energia_kwh"]
+        energia_actual = actual["_energia_kwh"]
+        if energia_anterior is not None and energia_actual is not None:
+            delta = energia_actual - energia_anterior
+            if delta >= 0:
+                yield anterior, inicio, horas, delta, "delta_energia_kwh"
+                continue
+            if energia_actual >= 0:
+                yield anterior, inicio, horas, energia_actual, "reset_energia_kwh"
+                continue
         potencia_w = anterior["_potencia_w"]
         if potencia_w is not None:
-            yield anterior, inicio, horas, potencia_w * horas / 1000
-
-
-def energia_por_acumulado(registros: list[dict]) -> float | None:
-    valores = [r["_energia_kwh"] for r in registros if r.get("_energia_kwh") is not None]
-    if len(valores) >= 2:
-        return max(0.0, max(valores) - min(valores))
-    return None
+            yield anterior, inicio, horas, potencia_w * horas / 1000, "integracion_potencia"
 
 
 def integrar_metricas(registros: list[dict], *, inicio_periodo: datetime, fin_periodo: datetime) -> dict:
@@ -177,20 +182,27 @@ def integrar_metricas(registros: list[dict], *, inicio_periodo: datetime, fin_pe
         "periodo_kwh": 0.0,
         "hoy_kwh": 0.0,
         "semana_previa_kwh_por_dia": {},
+        "cobertura_por_dia_horas": {},
         "hoy_vacio_kwh": 0.0,
         "semana_vacio_kwh": 0.0,
         "horas_ac_hoy": 0.0,
+        "horas_ac_vacio_hoy": 0.0,
         "horas_ac_fuera_horario_hoy": 0.0,
         "energia_util_por_dia": {},
         "energia_vacia_por_dia": {},
         "heatmap": {},
+        "fuentes_energia": {},
     }
 
-    for anterior, inicio, horas, kwh in iterar_intervalos(registros):
+    for anterior, inicio, horas, kwh, fuente in iterar_intervalos(registros):
         if inicio < semana_inicio.astimezone(timezone.utc) or inicio > fin_periodo:
             continue
         local = inicio.astimezone(ZONA_PANAMA)
         dia = local.date().isoformat()
+        acumulados["cobertura_por_dia_horas"][dia] = (
+            acumulados["cobertura_por_dia_horas"].get(dia, 0.0) + horas
+        )
+        acumulados["fuentes_energia"][fuente] = acumulados["fuentes_energia"].get(fuente, 0) + 1
 
         if inicio_periodo <= inicio <= fin_periodo:
             acumulados["periodo_kwh"] += kwh
@@ -200,7 +212,11 @@ def integrar_metricas(registros: list[dict], *, inicio_periodo: datetime, fin_pe
                 acumulados["horas_ac_hoy"] += horas
                 if not esta_en_horario_operativo(inicio):
                     acumulados["horas_ac_fuera_horario_hoy"] += horas
-        elif semana_inicio <= local < hoy_inicio:
+        elif (
+            semana_inicio <= local < hoy_inicio
+            and local.timetz().replace(tzinfo=None)
+            <= fin_periodo.astimezone(ZONA_PANAMA).timetz().replace(tzinfo=None)
+        ):
             acumulados["semana_previa_kwh_por_dia"][dia] = (
                 acumulados["semana_previa_kwh_por_dia"].get(dia, 0.0) + kwh
             )
@@ -215,25 +231,18 @@ def integrar_metricas(registros: list[dict], *, inicio_periodo: datetime, fin_pe
             acumulados["semana_vacio_kwh"] += kwh
             if hoy_inicio <= local < manana_inicio:
                 acumulados["hoy_vacio_kwh"] += kwh
+                acumulados["horas_ac_vacio_hoy"] += horas
 
         if local.weekday() < 6 and 6 <= local.hour < 23:
             clave = (local.weekday(), local.hour)
-            celda = acumulados["heatmap"].setdefault(clave, {"kwh": 0.0, "muestras": 0})
-            celda["kwh"] += kwh
-            celda["muestras"] += 1
-
-    registros_periodo = [r for r in registros if inicio_periodo <= r["_fecha"] <= fin_periodo]
-    registros_hoy = [
-        r
-        for r in registros
-        if hoy_inicio <= r["_fecha"].astimezone(ZONA_PANAMA) < manana_inicio
-    ]
-    acumulado_periodo = energia_por_acumulado(registros_periodo)
-    if acumulado_periodo is not None:
-        acumulados["periodo_kwh"] = acumulado_periodo
-    acumulado_hoy = energia_por_acumulado(registros_hoy)
-    if acumulado_hoy is not None:
-        acumulados["hoy_kwh"] = acumulado_hoy
+            celda = acumulados["heatmap"].setdefault(
+                clave,
+                {"por_fecha": {}, "cobertura_por_fecha": {}},
+            )
+            celda["por_fecha"][dia] = celda["por_fecha"].get(dia, 0.0) + kwh
+            celda["cobertura_por_fecha"][dia] = (
+                celda["cobertura_por_fecha"].get(dia, 0.0) + horas
+            )
     return acumulados
 
 
@@ -255,7 +264,7 @@ def construir_puntos(registros: list[dict], *, config: ConfiguracionRango, inici
             bucket["muestras_ocupacion"] += 1
 
     if config.modo == "energy":
-        for anterior, inicio, _horas, kwh in iterar_intervalos(registros):
+        for anterior, inicio, _horas, kwh, _fuente in iterar_intervalos(registros):
             if inicio < inicio_periodo or inicio > fin_periodo:
                 continue
             bucket_dt = clave_bucket(inicio, config)
@@ -312,10 +321,24 @@ def construir_heatmap(metricas: dict, registros: list[dict]) -> dict:
     horas = list(range(6, 23))
     puntos = []
     maximo = 0.0
+    celdas_con_cobertura = 0
+    celdas_repetidas = 0
     for dia_idx, dia in enumerate(dias):
         for hora in horas:
-            celda = metricas["heatmap"].get((dia_idx, hora), {"kwh": 0.0, "muestras": 0})
-            valor = celda["kwh"] / celda["muestras"] if celda["muestras"] else 0.0
+            celda = metricas["heatmap"].get(
+                (dia_idx, hora),
+                {"por_fecha": {}, "cobertura_por_fecha": {}},
+            )
+            valores_diarios = [
+                energia
+                for fecha, energia in celda["por_fecha"].items()
+                if celda["cobertura_por_fecha"].get(fecha, 0) >= COBERTURA_MINIMA_HORA
+            ]
+            valor = sum(valores_diarios) / len(valores_diarios) if valores_diarios else 0.0
+            if valores_diarios:
+                celdas_con_cobertura += 1
+            if len(valores_diarios) >= 2:
+                celdas_repetidas += 1
             maximo = max(maximo, valor)
             puntos.append({
                 "day": dia,
@@ -324,14 +347,19 @@ def construir_heatmap(metricas: dict, registros: list[dict]) -> dict:
                 "label": f"{hora}:00",
                 "kwh": round(valor, 3),
             })
-    fechas = {r["_fecha"].astimezone(ZONA_PANAMA).date() for r in registros}
+    total_celdas = len(dias) * len(horas)
+    cobertura_celdas_pct = celdas_con_cobertura / total_celdas * 100 if total_celdas else 0
+    repeticion_celdas_pct = celdas_repetidas / total_celdas * 100 if total_celdas else 0
     return {
         "days": dias,
         "hours": horas,
         "points": puntos,
         "max_kwh": round(maximo, 3),
-        "insufficient_data": len(fechas) < 14,
-        "empty_message": "Acumulando datos históricos",
+        "insufficient_data": cobertura_celdas_pct < 20 or repeticion_celdas_pct < 10,
+        "coverage_cells_pct": round(cobertura_celdas_pct, 1),
+        "repeated_cells_pct": round(repeticion_celdas_pct, 1),
+        "minimum_hour_coverage_pct": round(COBERTURA_MINIMA_HORA * 100),
+        "empty_message": "Estamos recopilando historial suficiente para identificar patrones.",
     }
 
 
@@ -359,23 +387,74 @@ def construir_resumen_dashboard(filas: list[dict], rango: str | None = "24h") ->
         if registro.get("_tarifa_kwh") is not None
     ]
     tarifa = tarifas_medidas[-1] if tarifas_medidas else configuracion.DASHBOARD_TARIFA_USD_KWH
-    baseline_dia = configuracion.DASHBOARD_BASELINE_KWH_DIA
-    baseline_periodo = baseline_dia * config.dias
-    ahorro_estimado = (baseline_periodo - metricas["periodo_kwh"]) * tarifa
-    ahorro_disponible = ahorro_estimado >= 0 and len(puntos) >= 2
-    dias_semana = list(metricas["semana_previa_kwh_por_dia"].values())
+    horas_objetivo = max(
+        0.0,
+        (fin_local - inicio_dia_local(fin_local)).total_seconds() / 3600,
+    )
+    cobertura_minima_horas = horas_objetivo * COBERTURA_MINIMA_DIA
+    dias_validos = {
+        fecha: energia
+        for fecha, energia in metricas["semana_previa_kwh_por_dia"].items()
+        if metricas["cobertura_por_dia_horas"].get(fecha, 0) >= cobertura_minima_horas
+    }
+    dias_semana = list(dias_validos.values())
     promedio_semana = sum(dias_semana) / len(dias_semana) if dias_semana else None
+    comparacion_disponible = len(dias_semana) >= 3 and promedio_semana is not None and promedio_semana >= 0.1
     comparacion_hoy = (
         ((metricas["hoy_kwh"] - promedio_semana) / promedio_semana) * 100
-        if promedio_semana and promedio_semana > 0
+        if comparacion_disponible
         else None
     )
-
-    energia_vacio = metricas["hoy_vacio_kwh"]
-    energia_vacio_scope = "hoy"
-    if energia_vacio <= 0 and metricas["semana_vacio_kwh"] > 0:
-        energia_vacio = metricas["semana_vacio_kwh"]
-        energia_vacio_scope = "semana"
+    diferencia_hoy_kwh = (
+        metricas["hoy_kwh"] - promedio_semana
+        if comparacion_disponible
+        else None
+    )
+    potencia_valida = [r for r in registros if r.get("_potencia_w") is not None]
+    pico = max(potencia_valida, key=lambda r: r["_potencia_w"]) if potencia_valida else None
+    potencia_promedio = (
+        sum(r["_potencia_w"] for r in potencia_valida) / len(potencia_valida)
+        if potencia_valida
+        else None
+    )
+    relacion_pico_promedio = (
+        pico["_potencia_w"] / potencia_promedio
+        if pico and potencia_promedio and potencia_promedio > 0
+        else None
+    )
+    costo_hoy = metricas["hoy_kwh"] * tarifa
+    costo_vacio_hoy = metricas["hoy_vacio_kwh"] * tarifa
+    porcentaje_vacio_hoy = (
+        metricas["hoy_vacio_kwh"] / metricas["hoy_kwh"] * 100
+        if metricas["hoy_kwh"] > 0
+        else None
+    )
+    dias_util_vacio = len({
+        *metricas["energia_util_por_dia"].keys(),
+        *metricas["energia_vacia_por_dia"].keys(),
+    })
+    hoy_clave = fin_local.date().isoformat()
+    cobertura_hoy_horas = metricas["cobertura_por_dia_horas"].get(hoy_clave, 0.0)
+    cobertura_hoy_pct = (
+        cobertura_hoy_horas / horas_objetivo * 100
+        if horas_objetivo > 0
+        else 0.0
+    )
+    registros_hoy = [
+        registro
+        for registro in registros
+        if registro["_fecha"].astimezone(ZONA_PANAMA).date() == fin_local.date()
+    ]
+    ultima_lectura = registros[-1]["_fecha"] if registros else None
+    edad_ultima_lectura_segundos = (
+        max(0.0, (fin_utc - ultima_lectura).total_seconds())
+        if ultima_lectura
+        else None
+    )
+    datos_recientes = (
+        edad_ultima_lectura_segundos is not None
+        and edad_ultima_lectura_segundos <= 15 * 60
+    )
 
     return {
         "range": clave_rango,
@@ -384,11 +463,12 @@ def construir_resumen_dashboard(filas: list[dict], rango: str | None = "24h") ->
         "timezone": "America/Panama",
         "tariff_usd_per_kwh": tarifa,
         "baseline": {
-            "kwh_per_day": baseline_dia,
-            "period_kwh": round(baseline_periodo, 3),
-            "chart_value": round(baseline_dia / 24 * 1000 if config.modo == "power" else baseline_dia, 3),
+            "kwh_per_day": None,
+            "period_kwh": None,
+            "chart_value": None,
             "chart_unit": "W" if config.modo == "power" else "kWh/dia",
-            "configured_in": "app.config.Configuracion.DASHBOARD_BASELINE_KWH_DIA",
+            "configured_in": None,
+            "reason": "No se muestra ahorro sin un baseline histórico validado.",
         },
         "chart": {
             "mode": config.modo,
@@ -402,18 +482,101 @@ def construir_resumen_dashboard(filas: list[dict], rango: str | None = "24h") ->
             "today_energy_kwh": round(metricas["hoy_kwh"], 1),
             "today_vs_week_avg_pct": round(comparacion_hoy, 1) if comparacion_hoy is not None else None,
             "week_avg_kwh": round(promedio_semana, 1) if promedio_semana is not None else None,
+            "comparison_delta_kwh": round(diferencia_hoy_kwh, 2) if diferencia_hoy_kwh is not None else None,
+            "comparison_days": len(dias_semana),
+            "comparison_available": comparacion_disponible,
+            "today_records": len(registros_hoy),
+            "today_coverage_pct": round(min(100.0, cobertura_hoy_pct), 1),
+            "data_recent": datos_recientes,
+            "latest_reading_at": ultima_lectura.isoformat() if ultima_lectura else None,
             "period_energy_kwh": round(metricas["periodo_kwh"], 1),
             "period_cost_usd": round(metricas["periodo_kwh"] * tarifa, 2),
+            "today_cost_usd": round(costo_hoy, 2),
             "ac_hours_today": round(metricas["horas_ac_hoy"], 1),
+            "ac_empty_hours_today": round(metricas["horas_ac_vacio_hoy"], 1),
             "ac_outside_schedule_hours_today": round(metricas["horas_ac_fuera_horario_hoy"], 1),
-            "empty_energy_kwh": round(energia_vacio, 1),
-            "empty_energy_scope": energia_vacio_scope,
-            "estimated_savings_usd": round(ahorro_estimado, 2) if ahorro_disponible else None,
-            "estimated_savings_available": ahorro_disponible,
-            "estimated_savings_reason": None if ahorro_disponible else "Historial insuficiente o consumo superior al baseline.",
+            "empty_energy_kwh": round(metricas["hoy_vacio_kwh"], 1),
+            "empty_energy_scope": "hoy",
+            "empty_energy_pct": round(porcentaje_vacio_hoy, 1) if porcentaje_vacio_hoy is not None else None,
+            "empty_cost_usd": round(costo_vacio_hoy, 2),
+            "peak_power_w": round(pico["_potencia_w"], 0) if pico else None,
+            "peak_power_at": pico["_fecha"].isoformat() if pico else None,
+            "average_power_w": round(potencia_promedio, 1) if potencia_promedio is not None else None,
+            "peak_vs_average_ratio": (
+                round(relacion_pico_promedio, 2)
+                if relacion_pico_promedio is not None
+                else None
+            ),
+            "peak_relevant": relacion_pico_promedio is not None and relacion_pico_promedio >= 1.5,
+            "estimated_savings_usd": None,
+            "estimated_savings_available": False,
+            "estimated_savings_reason": "No existe un baseline histórico validado para atribuir ahorro a ATMOS.",
         },
         "phase2": {
             "useful_vs_empty": construir_util_vs_vacio(metricas, fin_utc),
+            "useful_vs_empty_insufficient_data": dias_util_vacio < 3,
             "heatmap": construir_heatmap(metricas, registros),
+        },
+        "calculation_trace": {
+            "today_energy": {
+                "formula": "Prioridad: consumo_intervalo_kwh; si falta, suma de deltas positivos del acumulador (tratando resets); finalmente potencia_w × horas.",
+                "result_kwh": round(metricas["hoy_kwh"], 6),
+            },
+            "recent_average": {
+                "formula": "Promedio de días con datos entre los 7 anteriores, limitado al mismo horario transcurrido de hoy.",
+                "daily_values_kwh": [round(valor, 6) for valor in dias_semana],
+                "days_used": len(dias_semana),
+                "valid_dates": list(dias_validos.keys()),
+                "required_coverage_pct": round(COBERTURA_MINIMA_DIA * 100),
+                "target_hours_per_day": round(horas_objetivo, 6),
+                "minimum_covered_hours": round(cobertura_minima_horas, 6),
+                "covered_hours_by_date": {
+                    fecha: round(metricas["cobertura_por_dia_horas"].get(fecha, 0.0), 6)
+                    for fecha in metricas["semana_previa_kwh_por_dia"]
+                },
+                "result_kwh": round(promedio_semana, 6) if promedio_semana is not None else None,
+            },
+            "comparison": {
+                "formula": "(consumo_hoy - promedio_reciente) / promedio_reciente × 100",
+                "minimum_days": 3,
+                "minimum_denominator_kwh": 0.1,
+                "result_pct": round(comparacion_hoy, 6) if comparacion_hoy is not None else None,
+            },
+            "today_cost": {
+                "formula": "consumo_hoy_kwh × tarifa_usd_kwh",
+                "tariff_usd_kwh": tarifa,
+                "result_usd": round(costo_hoy, 6),
+            },
+            "empty_consumption": {
+                "formula": "Energía de intervalos de hoy con ocupación=false y AC reportado encendido.",
+                "result_kwh": round(metricas["hoy_vacio_kwh"], 6),
+                "result_pct": round(porcentaje_vacio_hoy, 6) if porcentaje_vacio_hoy is not None else None,
+                "associated_cost_usd": round(costo_vacio_hoy, 6),
+            },
+            "ac_runtime": {
+                "formula": "Suma de intervalos de hoy con aire_encendido_atmos/ac_encendido=true; cada hueco se limita a 10 minutos.",
+                "result_hours": round(metricas["horas_ac_hoy"], 6),
+                "empty_hours": round(metricas["horas_ac_vacio_hoy"], 6),
+            },
+            "peak_power": {
+                "formula": "Máximo potencia_w observado dentro de las lecturas del período consultado.",
+                "result_w": round(pico["_potencia_w"], 6) if pico else None,
+                "timestamp": pico["_fecha"].isoformat() if pico else None,
+                "average_w": round(potencia_promedio, 6) if potencia_promedio is not None else None,
+            },
+            "data_coverage": {
+                "period_start": inicio_periodo.isoformat(),
+                "period_end": fin_utc.isoformat(),
+                "today_records": len(registros_hoy),
+                "today_covered_hours": round(cobertura_hoy_horas, 6),
+                "today_coverage_pct": round(min(100.0, cobertura_hoy_pct), 6),
+                "latest_reading_at": ultima_lectura.isoformat() if ultima_lectura else None,
+                "latest_reading_age_seconds": (
+                    round(edad_ultima_lectura_segundos, 3)
+                    if edad_ultima_lectura_segundos is not None
+                    else None
+                ),
+                "energy_sources": metricas["fuentes_energia"],
+            },
         },
     }

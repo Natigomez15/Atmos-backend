@@ -445,6 +445,40 @@ def test_dashboard_prefiere_consumo_intervalo_y_tarifa_de_firebase():
     assert resumen["tariff_usd_per_kwh"] == 0.21
     assert resumen["metrics"]["today_energy_kwh"] == 0.2
     assert resumen["metrics"]["period_cost_usd"] == 0.05
+    assert resumen["metrics"]["today_cost_usd"] == 0.05
+    assert resumen["metrics"]["estimated_savings_usd"] is None
+    assert resumen["metrics"]["estimated_savings_available"] is False
+    assert resumen["calculation_trace"]["today_cost"]["tariff_usd_kwh"] == 0.21
+    assert resumen["calculation_trace"]["today_cost"]["result_usd"] == 0.0525
+
+
+def test_dashboard_suma_deltas_y_trata_reset_del_acumulador():
+    ahora = datetime.now(timezone.utc)
+    filas = [
+        {
+            "fecha_sync": (ahora - timedelta(minutes=3)).isoformat(),
+            "energia_kwh": 10.0,
+            "potencia_w": 1000.0,
+        },
+        {
+            "fecha_sync": (ahora - timedelta(minutes=2)).isoformat(),
+            "energia_kwh": 10.2,
+            "potencia_w": 1000.0,
+        },
+        {
+            "fecha_sync": (ahora - timedelta(minutes=1)).isoformat(),
+            "energia_kwh": 0.1,
+            "potencia_w": 1000.0,
+        },
+    ]
+
+    resumen = construir_resumen_dashboard(filas, "24h")
+
+    assert resumen["metrics"]["today_energy_kwh"] == 0.3
+    assert resumen["calculation_trace"]["data_coverage"]["energy_sources"] == {
+        "delta_energia_kwh": 1,
+        "reset_energia_kwh": 1,
+    }
 
 
 def test_potencia_no_confirma_estado_hasta_calibrar_umbrales(monkeypatch):

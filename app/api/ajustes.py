@@ -62,3 +62,103 @@ async def actualizar_configuracion_sistema(
     _=Depends(requerir_admin),
 ):
     return {**CONFIGURACION_SISTEMA, **cambios}
+
+ROLES_USUARIO = {"admin", "mantenimiento", "usuario"}
+
+
+@enrutador.get("/usuarios")
+async def listar_usuarios(_=Depends(requerir_admin)):
+    cliente = obtener_cliente()
+
+    respuesta = (
+        cliente.table("profiles")
+        .select("id, correo, nombre, rol, esta_activo")
+        .order("nombre")
+        .execute()
+    )
+
+    return respuesta.data or []
+
+
+@enrutador.patch("/usuarios/{usuario_id}")
+async def actualizar_usuario(
+    usuario_id: str,
+    cambios: dict[str, Any],
+    administrador: dict = Depends(requerir_admin),
+):
+    cliente = obtener_cliente()
+
+    usuario_objetivo = (
+        cliente.table("profiles")
+        .select("id, correo, nombre, rol, esta_activo")
+        .eq("id", usuario_id)
+        .execute()
+    )
+
+    if not usuario_objetivo.data:
+        raise HTTPException(
+            status_code=404,
+            detail="Usuario no encontrado",
+        )
+
+    actualizaciones: dict[str, Any] = {}
+
+    if "rol" in cambios:
+        rol = str(cambios["rol"] or "").strip().lower()
+
+        if rol not in ROLES_USUARIO:
+            raise HTTPException(
+                status_code=422,
+                detail="Rol no valido",
+            )
+
+        actualizaciones["rol"] = rol
+
+    if "esta_activo" in cambios:
+        esta_activo = cambios["esta_activo"]
+
+        if not isinstance(esta_activo, bool):
+            raise HTTPException(
+                status_code=422,
+                detail="esta_activo debe ser verdadero o falso",
+            )
+
+        actualizaciones["esta_activo"] = esta_activo
+
+    if not actualizaciones:
+        raise HTTPException(
+            status_code=422,
+            detail="No hay cambios validos para aplicar",
+        )
+
+    # Evitar que el administrador se bloquee accidentalmente.
+    if str(administrador["id"]) == usuario_id:
+        if actualizaciones.get("esta_activo") is False:
+            raise HTTPException(
+                status_code=422,
+                detail="No puedes desactivar tu propia cuenta",
+            )
+
+        if (
+            "rol" in actualizaciones
+            and actualizaciones["rol"] != "admin"
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="No puedes quitarte tu propio rol de administrador",
+            )
+
+    respuesta = (
+        cliente.table("profiles")
+        .update(actualizaciones)
+        .eq("id", usuario_id)
+        .execute()
+    )
+
+    if not respuesta.data:
+        raise HTTPException(
+            status_code=500,
+            detail="No se pudo actualizar el usuario",
+        )
+
+    return respuesta.data[0]

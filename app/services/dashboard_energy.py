@@ -10,7 +10,6 @@ from app.config import configuracion
 ZONA_PANAMA = ZoneInfo("America/Panama")
 MAX_INTERVALO_INTEGRACION_MIN = 10
 COBERTURA_MINIMA_DIA = 0.80
-COBERTURA_MINIMA_HORA = 0.75
 
 
 @dataclass(frozen=True)
@@ -144,6 +143,41 @@ def crear_bucket(dt: datetime) -> dict:
     }
 
 
+def acumular_intervalo_heatmap(
+    heatmap: dict,
+    *,
+    inicio: datetime,
+    horas: float,
+    energia_kwh: float,
+) -> None:
+    duracion = timedelta(hours=horas)
+    fin = inicio + duracion
+    cursor = inicio
+    duracion_segundos = duracion.total_seconds()
+    if duracion_segundos <= 0:
+        return
+
+    while cursor < fin:
+        local = cursor.astimezone(ZONA_PANAMA)
+        siguiente_hora_local = local.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        fin_tramo = min(fin, siguiente_hora_local.astimezone(timezone.utc))
+        proporcion = (fin_tramo - cursor).total_seconds() / duracion_segundos
+        fecha = local.date().isoformat()
+        clave = (local.weekday(), local.hour)
+        celda = heatmap.setdefault(
+            clave,
+            {"por_fecha": {}, "cobertura_por_fecha": {}},
+        )
+        celda["por_fecha"][fecha] = (
+            celda["por_fecha"].get(fecha, 0.0) + energia_kwh * proporcion
+        )
+        celda["cobertura_por_fecha"][fecha] = (
+            celda["cobertura_por_fecha"].get(fecha, 0.0)
+            + (fin_tramo - cursor).total_seconds() / 3600
+        )
+        cursor = fin_tramo
+
+
 def iterar_intervalos(registros: list[dict]):
     for anterior, actual in zip(registros, registros[1:]):
         inicio = anterior["_fecha"]
@@ -195,6 +229,12 @@ def integrar_metricas(registros: list[dict], *, inicio_periodo: datetime, fin_pe
     }
 
     for anterior, inicio, horas, kwh, fuente in iterar_intervalos(registros):
+        acumular_intervalo_heatmap(
+            acumulados["heatmap"],
+            inicio=inicio,
+            horas=horas,
+            energia_kwh=kwh,
+        )
         if inicio < semana_inicio.astimezone(timezone.utc) or inicio > fin_periodo:
             continue
         local = inicio.astimezone(ZONA_PANAMA)
@@ -233,16 +273,6 @@ def integrar_metricas(registros: list[dict], *, inicio_periodo: datetime, fin_pe
                 acumulados["hoy_vacio_kwh"] += kwh
                 acumulados["horas_ac_vacio_hoy"] += horas
 
-        if local.weekday() < 6 and 6 <= local.hour < 23:
-            clave = (local.weekday(), local.hour)
-            celda = acumulados["heatmap"].setdefault(
-                clave,
-                {"por_fecha": {}, "cobertura_por_fecha": {}},
-            )
-            celda["por_fecha"][dia] = celda["por_fecha"].get(dia, 0.0) + kwh
-            celda["cobertura_por_fecha"][dia] = (
-                celda["cobertura_por_fecha"].get(dia, 0.0) + horas
-            )
     return acumulados
 
 
@@ -317,48 +347,40 @@ def construir_util_vs_vacio(metricas: dict, fin_periodo: datetime) -> list[dict]
 
 
 def construir_heatmap(metricas: dict, registros: list[dict]) -> dict:
-    dias = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb"]
-    horas = list(range(6, 23))
+    dias = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+    horas = list(range(24))
     puntos = []
     maximo = 0.0
-    celdas_con_cobertura = 0
-    celdas_repetidas = 0
+    celdas_validas = 0
     for dia_idx, dia in enumerate(dias):
         for hora in horas:
             celda = metricas["heatmap"].get(
                 (dia_idx, hora),
                 {"por_fecha": {}, "cobertura_por_fecha": {}},
             )
-            valores_diarios = [
-                energia
-                for fecha, energia in celda["por_fecha"].items()
-                if celda["cobertura_por_fecha"].get(fecha, 0) >= COBERTURA_MINIMA_HORA
-            ]
-            valor = sum(valores_diarios) / len(valores_diarios) if valores_diarios else 0.0
+            valores_diarios = list(celda["por_fecha"].values())
+            valor = sum(valores_diarios) / len(valores_diarios) if valores_diarios else None
             if valores_diarios:
-                celdas_con_cobertura += 1
-            if len(valores_diarios) >= 2:
-                celdas_repetidas += 1
-            maximo = max(maximo, valor)
+                celdas_validas += 1
+                maximo = max(maximo, valor)
             puntos.append({
                 "day": dia,
                 "day_index": dia_idx,
                 "hour": hora,
-                "label": f"{hora}:00",
-                "kwh": round(valor, 3),
+                "label": f"{hora:02d}:00",
+                "kwh": round(valor, 3) if valor is not None else None,
+                "sample_days": len(valores_diarios),
             })
     total_celdas = len(dias) * len(horas)
-    cobertura_celdas_pct = celdas_con_cobertura / total_celdas * 100 if total_celdas else 0
-    repeticion_celdas_pct = celdas_repetidas / total_celdas * 100 if total_celdas else 0
+    cobertura_celdas_pct = celdas_validas / total_celdas * 100 if total_celdas else 0
     return {
         "days": dias,
         "hours": horas,
         "points": puntos,
         "max_kwh": round(maximo, 3),
-        "insufficient_data": cobertura_celdas_pct < 20 or repeticion_celdas_pct < 10,
+        "insufficient_data": celdas_validas == 0,
         "coverage_cells_pct": round(cobertura_celdas_pct, 1),
-        "repeated_cells_pct": round(repeticion_celdas_pct, 1),
-        "minimum_hour_coverage_pct": round(COBERTURA_MINIMA_HORA * 100),
+        "valid_cells": celdas_validas,
         "empty_message": "Estamos recopilando historial suficiente para identificar patrones.",
     }
 

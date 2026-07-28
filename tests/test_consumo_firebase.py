@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
+from zoneinfo import ZoneInfo
 
 from app.ml.impacto import estimar_consumo_registro, inferir_ac_encendido
 from app.ml.predictor import ServicioPredictor
@@ -479,6 +480,48 @@ def test_dashboard_suma_deltas_y_trata_reset_del_acumulador():
         "delta_energia_kwh": 1,
         "reset_energia_kwh": 1,
     }
+
+
+def test_heatmap_renderiza_datos_parciales_y_distingue_cero_de_ausencia(monkeypatch):
+    fin_panama = datetime(2026, 7, 27, 12, 0, tzinfo=ZoneInfo("America/Panama"))
+    monkeypatch.setattr("app.services.dashboard_energy.ahora_panama", lambda: fin_panama)
+    filas = [
+        {"fecha_sync": "2026-07-27T14:50:00+00:00"},
+        {
+            "fecha_sync": "2026-07-27T15:00:00+00:00",
+            "consumo_intervalo_kwh": 0.0,
+        },
+        {
+            "fecha_sync": "2026-07-27T15:10:00+00:00",
+            "consumo_intervalo_kwh": 0.24,
+        },
+    ]
+
+    heatmap = construir_resumen_dashboard(filas, "24h")["phase2"]["heatmap"]
+    lunes_09 = next(
+        punto
+        for punto in heatmap["points"]
+        if punto["day"] == "Lunes" and punto["hour"] == 9
+    )
+    lunes_10 = next(
+        punto
+        for punto in heatmap["points"]
+        if punto["day"] == "Lunes" and punto["hour"] == 10
+    )
+    lunes_11 = next(
+        punto
+        for punto in heatmap["points"]
+        if punto["day"] == "Lunes" and punto["hour"] == 11
+    )
+
+    assert len(heatmap["days"]) == 7
+    assert len(heatmap["hours"]) == 24
+    assert len(heatmap["points"]) == 168
+    assert heatmap["insufficient_data"] is False
+    assert lunes_09["kwh"] == 0.0
+    assert lunes_10["kwh"] == 0.24
+    assert lunes_10["sample_days"] == 1
+    assert lunes_11["kwh"] is None
 
 
 def test_potencia_no_confirma_estado_hasta_calibrar_umbrales(monkeypatch):

@@ -19,6 +19,7 @@ from app.services.sincronizador_firebase import (
     MAX_LECTURAS_FIREBASE_POR_CONSULTA,
     aplicar_estado_comando_firebase,
     sincronizar_firebase_supabase,
+    leer_lecturas_firebase_rango_rest,
     leer_ultimas_lecturas_firebase_rest,
     leer_ultima_lectura_valida_firebase_rest,
     preparar_registro_supabase,
@@ -372,16 +373,26 @@ async def listar_registros(
     pabellon: str | None = None,
     aire: str | None = None,
     limite: Annotated[int, Query(ge=1, le=MAX_LECTURAS_FIREBASE_POR_CONSULTA)] = 100,
+    horas: Annotated[int | None, Query(ge=1, le=24)] = None,
 ):
     # Para una zona/aire concretos, Firebase es la fuente primaria y única de
     # esta lectura. La copia en Supabase se mantiene mediante el sincronizador.
     if pabellon and aire:
         try:
-            lecturas_firebase = leer_ultimas_lecturas_firebase_rest(
-                pabellon=pabellon,
-                aire=aire,
-                limite=limite,
-            )
+            if horas is not None:
+                hasta = datetime.now(timezone.utc)
+                lecturas_firebase = leer_lecturas_firebase_rango_rest(
+                    pabellon=pabellon,
+                    aire=aire,
+                    desde=hasta - timedelta(hours=horas),
+                    hasta=hasta,
+                )
+            else:
+                lecturas_firebase = leer_ultimas_lecturas_firebase_rest(
+                    pabellon=pabellon,
+                    aire=aire,
+                    limite=limite,
+                )
             return _normalizar_historial_firebase(
                 lecturas_firebase,
                 pabellon,

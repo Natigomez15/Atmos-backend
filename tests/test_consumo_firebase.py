@@ -524,6 +524,46 @@ def test_heatmap_renderiza_datos_parciales_y_distingue_cero_de_ausencia(monkeypa
     assert lunes_11["kwh"] is None
 
 
+def test_dashboard_24h_agrupa_energia_por_hora_local_sin_inventar_datos(monkeypatch):
+    fin_panama = datetime(2026, 7, 28, 12, 30, tzinfo=ZoneInfo("America/Panama"))
+    monkeypatch.setattr("app.services.dashboard_energy.ahora_panama", lambda: fin_panama)
+    filas = [
+        {"fecha_sync": "2026-07-28T15:50:00+00:00"},
+        {
+            "fecha_sync": "2026-07-28T16:00:00+00:00",
+            "consumo_intervalo_kwh": 0.1,
+        },
+        {
+            "fecha_sync": "2026-07-28T16:10:00+00:00",
+            "consumo_intervalo_kwh": 0.2,
+        },
+    ]
+
+    grafica = construir_resumen_dashboard(filas, "24h")["chart"]
+    por_hora = {punto["label"]: punto for punto in grafica["points"]}
+
+    assert grafica["grouping"] == "hour"
+    assert grafica["unit"] == "kWh"
+    assert grafica["value_key"] == "energia_kwh"
+    assert len(grafica["points"]) == 24
+    assert por_hora["10:00"]["energia_kwh"] == 0.1
+    assert por_hora["11:00"]["energia_kwh"] == 0.2
+    assert por_hora["12:00"]["energia_kwh"] is None
+    assert por_hora["11:00"]["tooltip_label"] == "28/07/2026 · 11:00"
+
+
+def test_dashboard_3m_agrupa_por_semana(monkeypatch):
+    fin_panama = datetime(2026, 7, 28, 12, 30, tzinfo=ZoneInfo("America/Panama"))
+    monkeypatch.setattr("app.services.dashboard_energy.ahora_panama", lambda: fin_panama)
+
+    grafica = construir_resumen_dashboard([], "3m")["chart"]
+
+    assert grafica["grouping"] == "week"
+    assert len(grafica["points"]) == 13
+    assert all(punto["label"].startswith("Sem. ") for punto in grafica["points"])
+    assert all(punto["energia_kwh"] is None for punto in grafica["points"])
+
+
 def test_potencia_no_confirma_estado_hasta_calibrar_umbrales(monkeypatch):
     monkeypatch.setattr(configuracion, "AC_POWER_THRESHOLDS_CALIBRATED", False)
     assert inferir_ac_encendido({

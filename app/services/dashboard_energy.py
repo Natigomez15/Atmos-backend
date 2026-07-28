@@ -18,14 +18,15 @@ class ConfiguracionRango:
     modo: str
     bucket_horas: int
     etiqueta: str
+    agrupacion: str
 
 
 RANGOS: dict[str, ConfiguracionRango] = {
-    "24h": ConfiguracionRango(dias=1, modo="power", bucket_horas=1, etiqueta="24 h"),
-    "7d": ConfiguracionRango(dias=7, modo="energy", bucket_horas=24, etiqueta="7 dias"),
-    "15d": ConfiguracionRango(dias=15, modo="energy", bucket_horas=24, etiqueta="15 dias"),
-    "30d": ConfiguracionRango(dias=30, modo="energy", bucket_horas=24, etiqueta="30 dias"),
-    "3m": ConfiguracionRango(dias=90, modo="energy", bucket_horas=24, etiqueta="3 meses"),
+    "24h": ConfiguracionRango(1, "energy", 1, "24 h", "hour"),
+    "7d": ConfiguracionRango(7, "energy", 24, "7 días", "day"),
+    "15d": ConfiguracionRango(15, "energy", 24, "15 días", "day"),
+    "30d": ConfiguracionRango(30, "energy", 24, "30 días", "day"),
+    "3m": ConfiguracionRango(90, "energy", 168, "3 meses", "week"),
 }
 
 
@@ -117,19 +118,20 @@ def preparar_registros(filas: list[dict]) -> list[dict]:
 
 def clave_bucket(dt: datetime, config: ConfiguracionRango) -> datetime:
     local = dt.astimezone(ZONA_PANAMA)
-    if config.modo == "energy":
+    if config.agrupacion == "week":
+        inicio_semana = local.date() - timedelta(days=local.weekday())
+        return datetime.combine(inicio_semana, time.min, tzinfo=ZONA_PANAMA)
+    if config.agrupacion == "day":
         return datetime.combine(local.date(), time.min, tzinfo=ZONA_PANAMA)
-    hora = (local.hour // config.bucket_horas) * config.bucket_horas
-    return local.replace(hour=hora, minute=0, second=0, microsecond=0)
+    return local.replace(minute=0, second=0, microsecond=0)
 
 
 def etiqueta_bucket(dt: datetime, config: ConfiguracionRango) -> str:
-    if config.modo == "energy":
-        return dt.strftime("%d/%m")
-    if config.bucket_horas == 1:
+    if config.agrupacion == "hour":
         return dt.strftime("%H:00")
-    fin = dt + timedelta(hours=config.bucket_horas)
-    return f"{dt.strftime('%d/%m %H')}h-{fin.strftime('%H')}h"
+    if config.agrupacion == "week":
+        return f"Sem. {dt.strftime('%d/%m')}"
+    return dt.strftime("%d/%m")
 
 
 def crear_bucket(dt: datetime) -> dict:
@@ -140,6 +142,7 @@ def crear_bucket(dt: datetime) -> dict:
         "ocupadas": 0,
         "muestras_ocupacion": 0,
         "energia_kwh": 0.0,
+        "intervalos_energia": 0,
     }
 
 
@@ -276,30 +279,67 @@ def integrar_metricas(registros: list[dict], *, inicio_periodo: datetime, fin_pe
     return acumulados
 
 
+def inicios_buckets_grafica(config: ConfiguracionRango, fin_periodo: datetime) -> list[datetime]:
+    fin_local = fin_periodo.astimezone(ZONA_PANAMA)
+    if config.agrupacion == "hour":
+        ultimo = fin_local.replace(minute=0, second=0, microsecond=0)
+        return [ultimo - timedelta(hours=offset) for offset in range(23, -1, -1)]
+    if config.agrupacion == "week":
+        ultimo = clave_bucket(fin_periodo, config)
+        semanas = (config.dias + 6) // 7
+        return [ultimo - timedelta(weeks=offset) for offset in range(semanas - 1, -1, -1)]
+    ultimo = datetime.combine(fin_local.date(), time.min, tzinfo=ZONA_PANAMA)
+    return [ultimo - timedelta(days=offset) for offset in range(config.dias - 1, -1, -1)]
+
+
+def siguiente_bucket(inicio: datetime, config: ConfiguracionRango) -> datetime:
+    if config.agrupacion == "week":
+        return inicio + timedelta(weeks=1)
+    if config.agrupacion == "day":
+        return inicio + timedelta(days=1)
+    return inicio + timedelta(hours=1)
+
+
 def construir_puntos(registros: list[dict], *, config: ConfiguracionRango, inicio_periodo: datetime, fin_periodo: datetime) -> list[dict]:
-    buckets: dict[datetime, dict] = {}
+    inicios = inicios_buckets_grafica(config, fin_periodo)
+    buckets = {inicio: crear_bucket(inicio) for inicio in inicios}
+    inicio_grafica = inicios[0].astimezone(timezone.utc)
+
     for registro in registros:
         fecha = registro["_fecha"]
-        if fecha < inicio_periodo or fecha > fin_periodo:
+        if fecha < inicio_grafica or fecha > fin_periodo:
             continue
         bucket_dt = clave_bucket(fecha, config)
-        bucket = buckets.setdefault(bucket_dt, crear_bucket(bucket_dt))
-        potencia_w = registro["_potencia_w"]
-        if potencia_w is not None:
-            bucket["suma_potencia"] += potencia_w
-            bucket["muestras_potencia"] += 1
+        bucket = buckets.get(bucket_dt)
+        if bucket is None:
+            continue
         ocupado = registro["_ocupado"]
         if ocupado is not None:
             bucket["ocupadas"] += 1 if ocupado else 0
             bucket["muestras_ocupacion"] += 1
 
-    if config.modo == "energy":
-        for anterior, inicio, _horas, kwh, _fuente in iterar_intervalos(registros):
-            if inicio < inicio_periodo or inicio > fin_periodo:
-                continue
-            bucket_dt = clave_bucket(inicio, config)
-            bucket = buckets.setdefault(bucket_dt, crear_bucket(bucket_dt))
-            bucket["energia_kwh"] += kwh
+    for _anterior, inicio, horas, kwh, _fuente in iterar_intervalos(registros):
+        fin_intervalo = inicio + timedelta(hours=horas)
+        duracion_total = (fin_intervalo - inicio).total_seconds()
+        cursor = max(inicio, inicio_grafica)
+        fin_intervalo = min(fin_intervalo, fin_periodo)
+        if duracion_total <= 0 or cursor >= fin_intervalo:
+            continue
+        while cursor < fin_intervalo:
+            bucket_dt = clave_bucket(cursor, config)
+            bucket = buckets.get(bucket_dt)
+            if bucket is None:
+                break
+            fin_tramo = min(
+                fin_intervalo,
+                siguiente_bucket(bucket_dt, config).astimezone(timezone.utc),
+            )
+            segundos_tramo = (fin_tramo - cursor).total_seconds()
+            if segundos_tramo <= 0:
+                break
+            bucket["energia_kwh"] += kwh * (segundos_tramo / duracion_total)
+            bucket["intervalos_energia"] += 1
+            cursor = fin_tramo
 
     puntos = []
     for inicio, bucket in sorted(buckets.items()):
@@ -308,22 +348,18 @@ def construir_puntos(registros: list[dict], *, config: ConfiguracionRango, inici
             if bucket["muestras_ocupacion"]
             else None
         )
-        if config.modo == "energy":
-            valor = bucket["energia_kwh"]
-            campo = "energia_kwh"
-        else:
-            valor = (
-                bucket["suma_potencia"] / bucket["muestras_potencia"]
-                if bucket["muestras_potencia"]
-                else None
-            )
-            campo = "potencia_w"
-        if valor is None:
-            continue
+        valor = bucket["energia_kwh"] if bucket["intervalos_energia"] else None
+        local = inicio.astimezone(ZONA_PANAMA)
+        etiqueta_tooltip = (
+            local.strftime("%d/%m/%Y · %H:00")
+            if config.agrupacion == "hour"
+            else etiqueta_bucket(local, config)
+        )
         puntos.append({
             "bucket_start": inicio.isoformat(),
             "label": etiqueta_bucket(inicio, config),
-            campo: round(valor, 3),
+            "tooltip_label": etiqueta_tooltip,
+            "energia_kwh": round(valor, 3) if valor is not None else None,
             "ocupacion_pct": round(ocupacion_pct, 3) if ocupacion_pct is not None else None,
             "ocupado": ocupacion_pct is not None and ocupacion_pct >= 0.5,
             "ocupacion_banda": 1 if ocupacion_pct is not None and ocupacion_pct >= 0.5 else 0,
@@ -488,16 +524,17 @@ def construir_resumen_dashboard(filas: list[dict], rango: str | None = "24h") ->
             "kwh_per_day": None,
             "period_kwh": None,
             "chart_value": None,
-            "chart_unit": "W" if config.modo == "power" else "kWh/dia",
+            "chart_unit": "kWh",
             "configured_in": None,
             "reason": "No se muestra ahorro sin un baseline histórico validado.",
         },
         "chart": {
             "mode": config.modo,
-            "unit": "W" if config.modo == "power" else "kWh/dia",
-            "value_key": "potencia_w" if config.modo == "power" else "energia_kwh",
+            "unit": "kWh",
+            "value_key": "energia_kwh",
+            "grouping": config.agrupacion,
             "points": puntos,
-            "insufficient_data": len(puntos) < 2,
+            "insufficient_data": not any(punto["energia_kwh"] is not None for punto in puntos),
             "empty_message": "Datos insuficientes",
         },
         "metrics": {
